@@ -4,7 +4,7 @@ import requests
 import os
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")  # Usaremos variables de entorno en Render
-DESTINO_CHAT_ID = os.getenv("CHAT_ID")
+DESTINO_CHAT_ID = os.getenv("DESTINO_CHAT_ID")
 
 app = Flask(__name__)
 
