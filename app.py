@@ -3,8 +3,8 @@ from flask import Flask, request
 import requests
 import os
 
-BOT_TOKEN = os.getenv("8460626106:AAHuxHanaA5OXJwurWpOtwesCOaM08yHBOs")  # Usaremos variables de entorno en Render
-DESTINO_CHAT_ID = os.getenv("1135715854")
+BOT_TOKEN = os.getenv("BOT_TOKEN")  # Usaremos variables de entorno en Render
+DESTINO_CHAT_ID = os.getenv("CHAT_ID")
 
 app = Flask(__name__)
 
@@ -25,4 +25,4 @@ def webhook():
     return "ok"
 
 if __name__ == "__main__":
-    app.run(host="74.220.50.0", port=5000)
+    app.run(host="0.0.0.0", port=5000)
