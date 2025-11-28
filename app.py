@@ -25,4 +25,4 @@ def webhook():
     return "ok"
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="74.220.50.0", port=5000)
