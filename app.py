@@ -1,29 +1,24 @@
 
 from flask import Flask, request
-import os
-import requests
-import pandas as pd
-import logging
+import os, requests, pandas as pd, logging, base64
 
-# === Credenciales y configuración ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DESTINO_CHAT_ID = os.getenv("DESTINO_CHAT_ID")
 CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 TENANT_ID = os.getenv("TENANT_ID")
-EXCEL_PATH = os.getenv("EXCEL_PATH")  # Ej: "Documentos/Reporte.xlsx"
+
+# Tu enlace compartido de OneDrive
+ONEDRIVE_SHARE_URL = "https://1drv.ms/x/c/3fad8c902923be18/ETwxHKdkmdlLi7EPaoH6vXUB4R-qhJ3AMeMwEbek4LNong?e=b5SpNn"
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# === Utilidades Telegram ===
 def send_message(chat_id, texto):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": chat_id, "text": texto}
-    r = requests.post(url, json=payload, timeout=15)
+    r = requests.post(url, json={"chat_id": chat_id, "text": texto}, timeout=15)
     app.logger.info(f"sendMessage status={r.status_code}, resp={r.text}")
 
-# === OAuth2: client credentials para Graph ===
 def get_access_token():
     token_url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
     data = {
@@ -35,46 +30,49 @@ def get_access_token():
     r = requests.post(token_url, data=data, timeout=20)
     if r.status_code != 200:
         app.logger.error(f"Token error {r.status_code}: {r.text}")
-        raise RuntimeError("No se pudo obtener el access_token de Azure AD.")
+        raise RuntimeError("No se obtuvo token de Azure AD.")
     return r.json()["access_token"]
 
-# === Descarga del Excel desde OneDrive (Graph) ===
-def descargar_excel_a_archivo_local(token, one_drive_path, destino_local="temp.xlsx"):
-    """
-    Descarga el archivo de OneDrive usando Microsoft Graph:
-    GET /me/drive/root:/{path}:/content  (personal/usuario actual)
-    """
+def share_id_from_url(url: str) -> str:
+    encoded = base64.urlsafe_b64encode(url.encode("utf-8")).decode("utf-8").rstrip("=")
+    return f"u!{encoded}"
+
+def descargar_excel_por_share_url(share_url: str, destino_local="temp.xlsx"):
+    token = get_access_token()
     headers = {"Authorization": f"Bearer {token}"}
-    url = f"https://graph.microsoft.com/v1.0/me/drive/root:/{one_drive_path}:/content"
-    r = requests.get(url, headers=headers, timeout=30)
+    share_id = share_id_from_url(share_url)
+    api = f"https://graph.microsoft.com/v1.0/shares/{share_id}/driveItem/content"
+    r = requests.get(api, headers=headers, timeout=30)
     if r.status_code != 200:
         app.logger.error(f"Descarga error {r.status_code}: {r.text}")
-        raise RuntimeError("No se pudo descargar el Excel desde OneDrive.")
+        raise RuntimeError(f"No se pudo descargar el Excel (HTTP {r.status_code}).")
     with open(destino_local, "wb") as f:
         f.write(r.content)
     return destino_local
 
-# === Lógica de negocio: leer Excel y armar reporte ===
-def generar_reporte_desde_excel(ruta_local_excel):
-    """
-    Ejemplo: toma la primera fila y arma un texto.
-    Ajusta columnas según tu archivo.
-    """
-    df = pd.read_excel(ruta_local_excel)  # usa openpyxl para .xlsx
-    if df.empty:
+def formato_ultima_fila(ruta_local_excel: str) -> str:
+    # Leer Excel con pandas y tomar la última fila "real"
+    df = pd.read_excel(ruta_local_excel)  # requiere openpyxl para .xlsx
+    # Quitar filas completamente vacías (si las hubiera)
+    df_clean = df.dropna(how="all")
+    if df_clean.empty:
         return "📊 El Excel no tiene datos."
-    fila = df.iloc[0]
-    # Cambia 'Nombre' y 'Valor' por los nombres de columnas reales
-    nombre_col = "Nombre" if "Nombre" in df.columns else df.columns[0]
-    valor_col = "Valor" if "Valor" in df.columns else df.columns[1] if len(df.columns) > 1 else df.columns[0]
-    reporte = (
-        f"📊 Reporte automático:\n"
-        f"- {nombre_col}: {fila.get(nombre_col, '')}\n"
-        f"- {valor_col}: {fila.get(valor_col, '')}"
-    )
-    return reporte
+    ultima = df_clean.tail(1).iloc[0]
 
-# === Webhook Telegram ===
+    # Construir un mensaje con todas las columnas de la última fila
+    lineas = []
+    for col in df_clean.columns:
+        val = ultima[col]
+        # Convertir NaN a vacío y tipos a string bonitos
+        if pd.isna(val):
+            val = ""
+        elif isinstance(val, float):
+            # Quitar .0 cuando es entero
+            val = int(val) if val.is_integer() else round(val, 4)
+        lineas.append(f"- {col}: {val}")
+    mensaje = "✅ Nueva actualización (última fila del Excel):\n" + "\n".join(lineas)
+    return mensaje
+
 @app.route("/", methods=["POST"])
 def webhook():
     data = request.get_json(silent=True) or {}
@@ -91,20 +89,18 @@ def webhook():
         contenido = f"✅ La tarea se completó con éxito.\n\n{original_text}" if original_text else "✅ La tarea se completó con éxito."
         send_message(DESTINO_CHAT_ID, contenido)
 
-    # Nuevo comando: /reporte
+    # Nuevo comando: /reporte -> última fila
     elif lower == "/reporte":
         try:
-            token = get_access_token()
-            local_path = descargar_excel_a_archivo_local(token, EXCEL_PATH)
-            reporte = generar_reporte_desde_excel(local_path)
-            send_message(DESTINO_CHAT_ID, reporte)
+            local = descargar_excel_por_share_url(ONEDRIVE_SHARE_URL)
+            mensaje = formato_ultima_fila(local)
+            send_message(DESTINO_CHAT_ID, mensaje)
         except Exception as e:
             app.logger.exception("Error generando reporte")
             send_message(DESTINO_CHAT_ID, f"❌ Error generando reporte: {e}")
 
     return "ok", 200
 
-# Salud del servicio (útil para pings tipo UptimeRobot)
 @app.route("/", methods=["GET"])
 def health():
     return "up", 200
