@@ -48,12 +48,22 @@ def _public_client(cache=None):
     return msal.PublicClientApplication(CLIENT_ID, authority=AUTHORITY, token_cache=cache)
 
 def get_token_silent_only():
-    """Usa SOLO el token del caché. Si no existe, falla (no iniciar device flow aquí)."""
+    """
+    Usa el token del caché con account explícito.
+    Si no hay accounts en caché o silent falla, lanza error claro.
+    """
     cache = _load_token_cache()
     app_auth = _public_client(cache)
-    result = app_auth.acquire_token_silent(SCOPES, account=None)
+
+    accounts = app_auth.get_accounts()
+    if not accounts:
+        raise RuntimeError("No hay cuentas en caché. Ejecuta /init-auth y autoriza, luego intenta de nuevo.")
+
+    # Intenta con el primer account (puedes iterar si necesitas)
+    result = app_auth.acquire_token_silent(SCOPES, account=accounts[0])
     if not result or "access_token" not in result:
-        raise RuntimeError("Token no disponible. Ejecuta primero /init-auth, autoriza el código y vuelve a intentar.")
+        raise RuntimeError("Silent token no disponible. Repite /init-auth o revisa AUTHORITY/SCOPES.")
+
     return result["access_token"]
 
 def _auth_worker(flow, cache):
