@@ -20,7 +20,6 @@ SHEET_NAME = os.getenv("SHEET_NAME")  # ej: "Hoja1"
 TABLE_NAME = os.getenv("TABLE_NAME")  # ej: "Tabla1"
 
 ONLY_TRIGGER_WORD = (os.getenv("ONLY_TRIGGER_WORD") or "OK").strip().upper()
-USE_MARKDOWN = (os.getenv("USE_MARKDOWN") or "true").lower() == "true"
 
 # ===== Flask =====
 app = Flask(__name__)
@@ -151,62 +150,35 @@ def get_table_rows(item_id: str, table_name: str, access_token: str):
             rows.append(row["values"][0])
     return rows
 
-# ===== MarkdownV2 escape util =====
-MDV2_SPECIALS = set("_*~`>#+-=|{}.!")
-
-def escape_markdown_v2(text: str) -> str:
-    """Escapa caracteres especiales de MarkdownV2 para evitar errores de parseo en Telegram."""
-    if not text:
-        return ""
-    out = []
-    for ch in text:
-        if ch in MDV2_SPECIALS:
-            out.append("\\" + ch)
-        else:
-            out.append(ch)
-    return "".join(out)
-
-# --- reemplaza send_telegram_message para aceptar chat destino y parse_mode ---
+# --- envío a Telegram en texto plano (sin parse_mode) ---
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-def send_telegram_message(text: str, chat_id: str = None, parse_mode: str = None):
+def send_telegram_message(text: str, chat_id: str = None):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": chat_id or TELEGRAM_CHAT_ID,
         "text": text,
+        "disable_web_page_preview": True,  # no queremos previsualizaciones
     }
-    # Aplica parse_mode si se indica; de lo contrario respeta USE_MARKDOWN (MarkdownV2)
-    if parse_mode:
-        payload["parse_mode"] = parse_mode
-    elif USE_MARKDOWN:
-        payload["parse_mode"] = "MarkdownV2"
-
     r = requests.post(url, json=payload, timeout=20)
     try:
         r.raise_for_status()
     except Exception as e:
-        # Envía el error al grupo para depuración rápida (escapado seguro si usamos MarkdownV2)
+        # Envía el error al grupo para depuración rápida, también en texto plano
         try:
-            err_text = f"⚠️ Error al enviar: {str(e)}\nResp: {r.text}"
-            if USE_MARKDOWN:
-                err_text = escape_markdown_v2(err_text)
-                requests.post(
-                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                    json={"chat_id": TELEGRAM_CHAT_ID, "text": err_text, "parse_mode": "MarkdownV2"},
-                    timeout=10
-                )
-            else:
-                requests.post(
-                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                    json={"chat_id": TELEGRAM_CHAT_ID, "text": err_text},
-                    timeout=10
-                )
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={"chat_id": TELEGRAM_CHAT_ID,
+                      "text": f"⚠️ Error al enviar: {str(e)}\nResp: {r.text}",
+                      "disable_web_page_preview": True},
+                timeout=10
+            )
         except:
             pass
         raise
     return r.json()
 
-# --- confirmación basada en reply ---
+# --- confirmación basada en reply (texto plano) ---
 def send_confirmation_from_reply(msg):
     """
     Envía al chat personal una confirmación basada en el mensaje al que se respondió con 'OK'.
@@ -221,21 +193,18 @@ def send_confirmation_from_reply(msg):
     from_user = msg.get("from", {}) or {}
     who = from_user.get("first_name") or from_user.get("username") or "alguien"
 
-    original_text_safe = escape_markdown_v2(str(original_text))
-    who_safe = escape_markdown_v2(str(who))
+    confirmation = f"✅ Tarea confirmada por {who}. Márcala como terminada.\n\n{original_text}"
 
-    confirmation = f"✅ Tarea confirmada por {who_safe}. Márcala como terminada.\n\n{original_text_safe}"
-
-    # Confirmación en tu chat personal con MarkdownV2
-    send_telegram_message(confirmation, chat_id=TELEGRAM_CHAT_ID, parse_mode="MarkdownV2")
+    # Envía a tu chat personal (texto plano)
+    send_telegram_message(confirmation, chat_id=TELEGRAM_CHAT_ID)
     return confirmation
 
-# --- formato exacto del mensaje y menciones desde 'responsable' ---
+# --- formato de mensaje (texto plano) con menciones ---
 def build_message_with_fields(headers, last_row):
     """
-    Devuelve (mentions_line, body_text)
-      - mentions_line: texto plano con @usuarios (no escapado, sin parse_mode)
-      - body_text: contenido con etiquetas y campos (escapado para MarkdownV2)
+    Devuelve un único texto plano que incluye:
+      - menciones (@usuario ...)
+      - cuerpo con campos de la fila
     """
     if headers and len(headers) == len(last_row):
         keys = [_normalize_header(h) for h in headers]
@@ -264,23 +233,21 @@ def build_message_with_fields(headers, last_row):
         mentions.append(u)
     mentions_line = " ".join(mentions) if mentions else ""
 
-    # Escapa etiquetas y valores para MarkdownV2
-    esc = escape_markdown_v2 if USE_MARKDOWN else (lambda x: x)
-
     lines = []
-    lines.append(esc("Se tiene una tarea asignada:"))
-    lines.append(f"📊 {esc('Agrupación')}: {esc(str(agrupacion))}")
-    lines.append(f"🗓️ {esc('Mes planificado')}: {esc(str(mes_planificado))}")
-    lines.append(f"✅ {esc('Estatus')}: {esc(str(estatus))}")
+    if mentions_line:
+        lines.append(mentions_line)
+    lines.append("Se tiene una tarea asignada:")
+    lines.append(f"📊 Agrupación: {agrupacion}")
+    lines.append(f"🗓️ Mes planificado: {mes_planificado}")
+    lines.append(f"✅ Estatus: {estatus}")
     lines.append("")  # línea en blanco
-    lines.append(f"🔢 {esc('Código de equipo')}: {esc(str(codigo_equipo))}")
-    lines.append(f"🎼 {esc('Instrumento')}: {esc(str(instrumento))}")
-    lines.append(f"⚙️ {esc('Ubicación')}: {esc(str(ubicacion))}")
-    lines.append(f"🏢 {esc('Departamento')}: {esc(str(departamento))}")
-    lines.append(f"📝 {esc('Actividad')}: {esc(str(actividad))}")
-    body_text = "\n".join(lines)
+    lines.append(f"🔢 Código de equipo: {codigo_equipo}")
+    lines.append(f"🎼 Instrumento: {instrumento}")
+    lines.append(f"⚙️ Ubicación: {ubicacion}")
+    lines.append(f"🏢 Departamento: {departamento}")
+    lines.append(f"📝 Actividad: {actividad}")
 
-    return mentions_line, body_text
+    return "\n".join(lines)
 
 # --- lectura de última fila y envío ---
 def read_last_row_and_message():
@@ -305,25 +272,18 @@ def read_last_row_and_message():
     else:
         raise RuntimeError("Configura SHEET_NAME o TABLE_NAME.")
 
-    mentions_line, body_text = build_message_with_fields(headers, last_row)
+    msg = build_message_with_fields(headers, last_row)
 
-    # 1) Enviar menciones en texto plano (sin parse_mode) para asegurar notificación y evitar errores por '.'/'_'
-    if mentions_line:
-        send_telegram_message(mentions_line, chat_id=TELEGRAM_CHAT_ID, parse_mode=None)
+    # envía al grupo (texto plano)
+    send_telegram_message(msg, chat_id=TELEGRAM_CHAT_ID)
 
-    # 2) Enviar el cuerpo con MarkdownV2 (ya escapado)
-    send_telegram_message(body_text, chat_id=TELEGRAM_CHAT_ID, parse_mode="MarkdownV2" if USE_MARKDOWN else None)
-
-    # Confirmación a tu chat personal
+    # confirmación a tu chat personal (texto plano)
     if TELEGRAM_CHAT_ID:
-        # En la confirmación, incluir el cuerpo (formato) y opcionalmente repetir menciones en texto plano
-        confirm_text = "✅ Envío completado.\n\n" + body_text
-        send_telegram_message(confirm_text, chat_id=TELEGRAM_CHAT_ID, parse_mode="MarkdownV2" if USE_MARKDOWN else None)
+        send_telegram_message("✅ Envío completado.\n\n" + msg, chat_id=TELEGRAM_CHAT_ID)
 
-    # Preview que devolvemos (cuerpo)
-    return body_text
+    return msg
 
-# --- NUEVO: dedup por update_id ---
+# --- dedup por update_id ---
 LAST_UPDATE_FILE = "/tmp/last_update_id"
 
 def _is_duplicate_update(update_id: int) -> bool:
@@ -394,17 +354,10 @@ def telegram_webhook():
             preview = read_last_row_and_message()
             return {"ok": True, "preview": preview}
         except Exception as e:
-            # Envía error al grupo (texto plano para evitar parseo)
+            # error al grupo, texto plano
             try:
-                err_text = f"⚠️ Error al leer/enviar: {str(e)}"
-                # En el cuerpo de error que lleva detalles, usa MarkdownV2 escapado si está activo
-                if USE_MARKDOWN:
-                    err_text = escape_markdown_v2(err_text)
-                    send_telegram_message(err_text, chat_id=TELEGRAM_CHAT_ID, parse_mode="MarkdownV2")
-                else:
-                    send_telegram_message(err_text, chat_id=TELEGRAM_CHAT_ID, parse_mode=None)
+                send_telegram_message(f"⚠️ Error al leer/enviar: {str(e)}", chat_id=TELEGRAM_CHAT_ID)
             except:
                 pass
             return {"ok": False, "error": str(e)}, 500
     else:
-        return {"ok": True, "ignored": True}
