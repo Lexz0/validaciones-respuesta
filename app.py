@@ -151,7 +151,7 @@ def get_table_rows(item_id: str, table_name: str, access_token: str):
     return rows
 
 # --- envío a Telegram en texto plano (sin parse_mode) ---
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_PERSONAL_CHAT_ID = os.getenv("TELEGRAM_PERSONAL_CHAT_ID")
 
 def send_telegram_message(text: str, chat_id: str = None):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -184,8 +184,8 @@ def send_confirmation_from_reply(msg):
     Envía al chat personal una confirmación basada en el mensaje al que se respondió con 'OK'.
     msg: dict del Update.message
     """
-    if not TELEGRAM_CHAT_ID:
-        raise RuntimeError("Define TELEGRAM_CHAT_ID para enviar la confirmación personal.")
+    if not TELEGRAM_PERSONAL_CHAT_ID:
+        raise RuntimeError("Define TELEGRAM_PERSONAL_CHAT_ID para enviar la confirmación personal.")
     reply = msg.get("reply_to_message") or {}
     original_text = reply.get("text") or reply.get("caption") or ""
     if not original_text:
@@ -196,7 +196,7 @@ def send_confirmation_from_reply(msg):
     confirmation = f"✅ Tarea confirmada por {who}. Márcala como terminada.\n\n{original_text}"
 
     # Envía a tu chat personal (texto plano)
-    send_telegram_message(confirmation, chat_id=TELEGRAM_CHAT_ID)
+    send_telegram_message(confirmation, chat_id=TELEGRAM_PERSONAL_CHAT_ID)
     return confirmation
 
 # --- formato de mensaje (texto plano) con menciones ---
@@ -278,8 +278,8 @@ def read_last_row_and_message():
     send_telegram_message(msg, chat_id=TELEGRAM_CHAT_ID)
 
     # confirmación a tu chat personal (texto plano)
-    if TELEGRAM_CHAT_ID:
-        send_telegram_message("✅ Envío completado.\n\n" + msg, chat_id=TELEGRAM_CHAT_ID)
+    if TELEGRAM_PERSONAL_CHAT_ID:
+        send_telegram_message("✅ Envío completado.\n\n" + msg, chat_id=TELEGRAM_PERSONAL_CHAT_ID)
 
     return msg
 
@@ -360,3 +360,4 @@ def telegram_webhook():
             except:
                 pass
             return {"ok": False, "error": str(e)}, 500
+    else:
