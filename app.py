@@ -360,4 +360,3 @@ def telegram_webhook():
             except:
                 pass
             return {"ok": False, "error": str(e)}, 500
-    else:
