@@ -332,30 +332,6 @@ def build_message_with_fields(headers, last_row):
 
     return "\n".join(lines)
 
-
-
-
-# ===== Webhook de Telegram: responde al 'OK' =====
-@app.route("/telegram-webhook", methods=["POST"])
-def telegram_webhook():
-    data = request.get_json(force=True) or {}
-    msg = data.get("message") or data.get("edited_message") or {}
-    text = (msg.get("text") or "").strip()
-
-    if text.upper() == ONLY_TRIGGER_WORD:
-        try:
-            token = get_token_silent_only()
-            preview = read_last_row_and_message_with_token(token)
-            return {"ok": True, "preview": preview}
-        except Exception as e:
-            try:
-                send_telegram_message(f"⚠️ Error al leer/enviar: {e}")
-            except:
-                pass
-            return {"ok": False, "error": str(e)}, 500
-    else:
-        return {"ok": True, "ignored": True}
-
 # ===== Endpoints de soporte =====
 @app.route("/init-auth", methods=["GET"])
 def init_auth():
