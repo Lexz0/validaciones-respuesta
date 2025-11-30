@@ -7,7 +7,7 @@ from flask import Flask, request
 # ===== Config =====
 CLIENT_ID = os.getenv("CLIENT_ID")
 AUTHORITY = "https://login.microsoftonline.com/consumers"  # cuentas personales
-SCOPES = ["Files.Read", "offline_access"]
+SCOPES = ["Files.ReadWrite"]
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
