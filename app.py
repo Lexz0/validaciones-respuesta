@@ -65,7 +65,6 @@ def get_token_silent_only():
     accounts = app_auth.get_accounts()
     if not accounts:
         raise RuntimeError("No hay cuentas en caché. Ejecuta /init-auth y autoriza, luego intenta de nuevo.")
-    # Intenta con el primer account (puedes iterar si necesitas)
     result = app_auth.acquire_token_silent(SCOPES, account=accounts[0])
     if not result or "access_token" not in result:
         raise RuntimeError("Silent token no disponible. Repite /init-auth o revisa AUTHORITY/SCOPES.")
@@ -105,17 +104,15 @@ def start_device_flow_async():
             f"No se pudo iniciar device flow. Revisa CLIENT_ID, AUTHORITY ('consumers' vs 'common'), "
             f"y que tu app en Azure tenga 'Allow public client flows' habilitado. Detalle: {flow}"
         )
-    # Arranca hilo que hará el polling sin bloquear este request
     _auth_state = {"running": True, "message": None, "error": None}
     _auth_thread = threading.Thread(target=_auth_worker, args=(flow, cache), daemon=True)
     _auth_thread.start()
-    # Devuelve datos para que autorices ya
     return {
         "status": "started",
         "verification_uri": flow.get("verification_uri"),
         "user_code": flow.get("user_code"),
-        "expires_in": flow.get("expires_in"),  # segundos
-        "interval": flow.get("interval"),      # polling interval sugerido
+        "expires_in": flow.get("expires_in"),
+        "interval": flow.get("interval"),
         "note": "Ve a la URL y pega el código. Luego consulta /auth-status hasta ver 'Autenticado y token cacheado'.",
     }
 
@@ -134,7 +131,7 @@ def get_drive_item_from_share(sharing_url: str, access_token: str):
         timeout=30,
     )
     r.raise_for_status()
-    return r.json()  # contiene id, name, etc.
+    return r.json()
 
 def get_used_range_values(item_id: str, sheet_name: str, access_token: str):
     url = f"{GRAPH}/drive/items/{item_id}/workbook/worksheets('{sheet_name}')/usedRange(valuesOnly=true)?$select=text,address"
@@ -158,10 +155,7 @@ def get_table_rows(item_id: str, table_name: str, access_token: str):
 MDV2_SPECIALS = set("_*~`>#+-=|{}.!")
 
 def escape_markdown_v2(text: str) -> str:
-    """
-    Escapa caracteres especiales de MarkdownV2 para evitar errores de parseo en Telegram.
-    (No escapamos emojis ni letras; tampoco escapamos saltos de línea.)
-    """
+    """Escapa caracteres especiales de MarkdownV2 para evitar errores de parseo en Telegram."""
     if not text:
         return ""
     out = []
@@ -173,7 +167,7 @@ def escape_markdown_v2(text: str) -> str:
     return "".join(out)
 
 # --- reemplaza send_telegram_message para aceptar chat destino y parse_mode ---
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_PERSONAL_CHAT_ID = os.getenv("TELEGRAM_PERSONAL_CHAT_ID")
 
 def send_telegram_message(text: str, chat_id: str = None, parse_mode: str = None):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -181,7 +175,7 @@ def send_telegram_message(text: str, chat_id: str = None, parse_mode: str = None
         "chat_id": chat_id or TELEGRAM_CHAT_ID,
         "text": text,
     }
-    # Si se pasa parse_mode explícito, úsalo; si no, respeta USE_MARKDOWN (MarkdownV2)
+    # Aplica parse_mode si se indica; de lo contrario respeta USE_MARKDOWN (MarkdownV2)
     if parse_mode:
         payload["parse_mode"] = parse_mode
     elif USE_MARKDOWN:
@@ -191,17 +185,22 @@ def send_telegram_message(text: str, chat_id: str = None, parse_mode: str = None
     try:
         r.raise_for_status()
     except Exception as e:
-        # Envía el error al grupo para depuración rápida
+        # Envía el error al grupo para depuración rápida (escapado seguro si usamos MarkdownV2)
         try:
-            requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "text": f"⚠️ Error al enviar: {escape_markdown_v2(str(e))}\nResp: {escape_markdown_v2(r.text)}",
-                    "parse_mode": "MarkdownV2" if USE_MARKDOWN else None
-                },
-                timeout=10
-            )
+            err_text = f"⚠️ Error al enviar: {str(e)}\nResp: {r.text}"
+            if USE_MARKDOWN:
+                err_text = escape_markdown_v2(err_text)
+                requests.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                    json={"chat_id": TELEGRAM_CHAT_ID, "text": err_text, "parse_mode": "MarkdownV2"},
+                    timeout=10
+                )
+            else:
+                requests.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                    json={"chat_id": TELEGRAM_CHAT_ID, "text": err_text},
+                    timeout=10
+                )
         except:
             pass
         raise
@@ -213,38 +212,37 @@ def send_confirmation_from_reply(msg):
     Envía al chat personal una confirmación basada en el mensaje al que se respondió con 'OK'.
     msg: dict del Update.message
     """
-    if not TELEGRAM_CHAT_ID:
-        raise RuntimeError("Define TELEGRAM_CHAT_ID para enviar la confirmación personal.")
+    if not TELEGRAM_PERSONAL_CHAT_ID:
+        raise RuntimeError("Define TELEGRAM_PERSONAL_CHAT_ID para enviar la confirmación personal.")
     reply = msg.get("reply_to_message") or {}
-    # El texto del original puede venir en 'text' o 'caption' si era media
     original_text = reply.get("text") or reply.get("caption") or ""
     if not original_text:
         original_text = "(mensaje original sin texto)"
-    # Quien confirmó
     from_user = msg.get("from", {}) or {}
     who = from_user.get("first_name") or from_user.get("username") or "alguien"
 
-    # Escapar para MarkdownV2
     original_text_safe = escape_markdown_v2(str(original_text))
     who_safe = escape_markdown_v2(str(who))
 
     confirmation = f"✅ Tarea confirmada por {who_safe}. Márcala como terminada.\n\n{original_text_safe}"
 
-    # Envía a tu chat personal con MarkdownV2
-    send_telegram_message(confirmation, chat_id=TELEGRAM_CHAT_ID, parse_mode="MarkdownV2")
+    # Confirmación en tu chat personal con MarkdownV2
+    send_telegram_message(confirmation, chat_id=TELEGRAM_PERSONAL_CHAT_ID, parse_mode="MarkdownV2")
     return confirmation
 
-# --- NUEVO: formato exacto del mensaje y menciones desde 'responsable' ---
+# --- formato exacto del mensaje y menciones desde 'responsable' ---
 def build_message_with_fields(headers, last_row):
-    # mapea headers -> valores
+    """
+    Devuelve (mentions_line, body_text)
+      - mentions_line: texto plano con @usuarios (no escapado, sin parse_mode)
+      - body_text: contenido con etiquetas y campos (escapado para MarkdownV2)
+    """
     if headers and len(headers) == len(last_row):
         keys = [_normalize_header(h) for h in headers]
         row = {k: v for k, v in zip(keys, last_row)}
     else:
-        # fallback: sin encabezados claros, usa índices
         row = {f"col_{i}": v for i, v in enumerate(last_row)}
 
-    # lee campos (ajusta estos nombres si en tu Excel difieren)
     responsable     = row.get("responsable", "")
     agrupacion      = row.get("agrupacion", "")
     mes_planificado = row.get("mes_planificado", row.get("mes", ""))
@@ -255,7 +253,7 @@ def build_message_with_fields(headers, last_row):
     departamento    = row.get("departamento", "")
     actividad       = row.get("actividad", row.get("tarea", ""))
 
-    # generar menciones tipo @K @D a partir de "K,D" o "K, D"
+    # menciones
     mentions = []
     for token in (responsable or "").replace(";", ",").split(","):
         u = token.strip()
@@ -263,17 +261,13 @@ def build_message_with_fields(headers, last_row):
             continue
         if not u.startswith("@"):
             u = "@" + u
-        # Dejar menciones en crudo para no romper el username
         mentions.append(u)
     mentions_line = " ".join(mentions) if mentions else ""
 
-    # Escapa campos/etiquetas si USE_MARKDOWN
+    # Escapa etiquetas y valores para MarkdownV2
     esc = escape_markdown_v2 if USE_MARKDOWN else (lambda x: x)
 
     lines = []
-    if mentions_line:
-        # NOTA: no escapamos menciones_line para preservar la mención
-        lines.append(mentions_line)
     lines.append(esc("Se tiene una tarea asignada:"))
     lines.append(f"📊 {esc('Agrupación')}: {esc(str(agrupacion))}")
     lines.append(f"🗓️ {esc('Mes planificado')}: {esc(str(mes_planificado))}")
@@ -284,7 +278,9 @@ def build_message_with_fields(headers, last_row):
     lines.append(f"⚙️ {esc('Ubicación')}: {esc(str(ubicacion))}")
     lines.append(f"🏢 {esc('Departamento')}: {esc(str(departamento))}")
     lines.append(f"📝 {esc('Actividad')}: {esc(str(actividad))}")
-    return "\n".join(lines)
+    body_text = "\n".join(lines)
+
+    return mentions_line, body_text
 
 # --- lectura de última fila y envío ---
 def read_last_row_and_message():
@@ -309,17 +305,23 @@ def read_last_row_and_message():
     else:
         raise RuntimeError("Configura SHEET_NAME o TABLE_NAME.")
 
-    # mensaje con formato exacto (ya escapado internamente si USE_MARKDOWN)
-    msg = build_message_with_fields(headers, last_row)
+    mentions_line, body_text = build_message_with_fields(headers, last_row)
 
-    # envía al grupo
-    send_telegram_message(msg, chat_id=TELEGRAM_CHAT_ID)
+    # 1) Enviar menciones en texto plano (sin parse_mode) para asegurar notificación y evitar errores por '.'/'_'
+    if mentions_line:
+        send_telegram_message(mentions_line, chat_id=TELEGRAM_CHAT_ID, parse_mode=None)
 
-    # confirmación a tu chat personal (si está configurado)
-    if TELEGRAM_CHAT_ID:
-        send_telegram_message("✅ Envío completado.\n\n" + msg, chat_id=TELEGRAM_CHAT_ID)
+    # 2) Enviar el cuerpo con MarkdownV2 (ya escapado)
+    send_telegram_message(body_text, chat_id=TELEGRAM_CHAT_ID, parse_mode="MarkdownV2" if USE_MARKDOWN else None)
 
-    return msg
+    # Confirmación a tu chat personal
+    if TELEGRAM_PERSONAL_CHAT_ID:
+        # En la confirmación, incluir el cuerpo (formato) y opcionalmente repetir menciones en texto plano
+        confirm_text = "✅ Envío completado.\n\n" + body_text
+        send_telegram_message(confirm_text, chat_id=TELEGRAM_PERSONAL_CHAT_ID, parse_mode="MarkdownV2" if USE_MARKDOWN else None)
+
+    # Preview que devolvemos (cuerpo)
+    return body_text
 
 # --- NUEVO: dedup por update_id ---
 LAST_UPDATE_FILE = "/tmp/last_update_id"
@@ -331,18 +333,15 @@ def _is_duplicate_update(update_id: int) -> bool:
                 last = int(f.read().strip())
                 if update_id <= last:
                     return True
-        # guarda el nuevo id
         with open(LAST_UPDATE_FILE, "w") as f:
             f.write(str(update_id))
     except Exception:
-        # si falla el archivo, no bloquees la ejecución
         pass
     return False
 
 # ===== Endpoints de soporte =====
 @app.route("/init-auth", methods=["GET"])
 def init_auth():
-    """Inicia Device Flow en segundo plano y devuelve el código/URL de verificación."""
     try:
         payload = start_device_flow_async()
         return {"ok": True, **payload}
@@ -351,14 +350,12 @@ def init_auth():
 
 @app.route("/auth-status", methods=["GET"])
 def auth_status():
-    """Consulta el estado del Device Flow / token cacheado."""
     global _auth_state
     status = {
         "running": _auth_state.get("running"),
         "message": _auth_state.get("message"),
         "error": _auth_state.get("error"),
     }
-    # Además, intenta un silent para confirmar si ya hay token
     try:
         _ = get_token_silent_only()
         status["token_ready"] = True
@@ -368,11 +365,9 @@ def auth_status():
 
 @app.route("/reset-auth", methods=["POST"])
 def reset_auth():
-    """Borra la caché de MSAL. Luego llama /init-auth para reautorizar."""
     try:
         if os.path.exists(TOKEN_CACHE_PATH):
             os.remove(TOKEN_CACHE_PATH)
-        # Reinicia estado
         global _auth_state
         _auth_state = {"running": False, "message": None, "error": None}
         return {"ok": True, "message": "Cache borrado. Llama /init-auth para reautorizar."}
@@ -385,29 +380,31 @@ def telegram_webhook():
     data = request.get_json(force=True) or {}
     update_id = data.get("update_id")
 
-    # Idempotencia: evita reprocesar el mismo update
     if isinstance(update_id, int) and _is_duplicate_update(update_id):
         return {"ok": True, "duplicate": True}
 
-    msg = data.get("message") or {}  # solo 'message', ignoramos 'edited_message'
+    msg = data.get("message") or {}
     text = (msg.get("text") or "").strip()
 
     if text.upper() == ONLY_TRIGGER_WORD:
         try:
-            # Si es reply a un mensaje, enviamos confirmación personal con el contenido original
             if msg.get("reply_to_message"):
                 confirmation_preview = send_confirmation_from_reply(msg)
                 return {"ok": True, "preview": confirmation_preview}
-            # Si NO es reply: leer última fila y publicar + confirmar
             preview = read_last_row_and_message()
             return {"ok": True, "preview": preview}
         except Exception as e:
-            # Responde al grupo con el error para depuración rápida
+            # Envía error al grupo (texto plano para evitar parseo)
             try:
-                send_telegram_message(f"⚠️ Error al leer/enviar: {escape_markdown_v2(str(e))}")
+                err_text = f"⚠️ Error al leer/enviar: {str(e)}"
+                # En el cuerpo de error que lleva detalles, usa MarkdownV2 escapado si está activo
+                if USE_MARKDOWN:
+                    err_text = escape_markdown_v2(err_text)
+                    send_telegram_message(err_text, chat_id=TELEGRAM_CHAT_ID, parse_mode="MarkdownV2")
+                else:
+                    send_telegram_message(err_text, chat_id=TELEGRAM_CHAT_ID, parse_mode=None)
             except:
                 pass
             return {"ok": False, "error": str(e)}, 500
     else:
-        # Ignora otros textos
         return {"ok": True, "ignored": True}
