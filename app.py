@@ -1,110 +1,162 @@
 
+import os
+import base64
+import requests
 from flask import Flask, request
-import os, requests, pandas as pd, logging, base64
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-DESTINO_CHAT_ID = os.getenv("DESTINO_CHAT_ID")
+# ===== Config =====
 CLIENT_ID = os.getenv("CLIENT_ID")
-CLIENT_SECRET = os.getenv("CLIENT_SECRET")
-TENANT_ID = os.getenv("TENANT_ID")
+AUTHORITY = "https://login.microsoftonline.com/consumers"  # cuentas personales
+SCOPES = ["Files.Read", "offline_access"]
 
-# Tu enlace compartido de OneDrive
-ONEDRIVE_SHARE_URL = "https://1drv.ms/x/c/3fad8c902923be18/ETwxHKdkmdlLi7EPaoH6vXUB4R-qhJ3AMeMwEbek4LNong?e=b5SpNn"
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+EXCEL_SHARE_URL = os.getenv("EXCEL_SHARE_URL")
+SHEET_NAME = os.getenv("SHEET_NAME")  # ej: "Hoja1"
+TABLE_NAME = os.getenv("TABLE_NAME")  # ej: "Tabla1"
+
+ONLY_TRIGGER_WORD = (os.getenv("ONLY_TRIGGER_WORD") or "OK").strip().upper()
+USE_MARKDOWN = (os.getenv("USE_MARKDOWN") or "true").lower() == "true"
+
+# ===== Flask =====
 app = Flask(__name__)
-logging.basicConfig(level=logging.INFO)
 
-def send_message(chat_id, texto):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    r = requests.post(url, json={"chat_id": chat_id, "text": texto}, timeout=15)
-    app.logger.info(f"sendMessage status={r.status_code}, resp={r.text}")
+# ===== MSAL (Device Code) =====
+import msal
+TOKEN_CACHE_PATH = "/tmp/msal_cache.json"
 
-def get_access_token():
-    token_url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
-    data = {
-        "client_id": CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
-        "scope": "https://graph.microsoft.com/.default",
-        "grant_type": "client_credentials",
+def _load_token_cache():
+    cache = msal.SerializableTokenCache()
+    if os.path.exists(TOKEN_CACHE_PATH):
+        with open(TOKEN_CACHE_PATH, "r") as f:
+            cache.deserialize(f.read())
+    return cache
+
+def _save_token_cache(cache):
+    if cache.has_state_changed:
+        with open(TOKEN_CACHE_PATH, "w") as f:
+            f.write(cache.serialize())
+
+def acquire_token():
+    cache = _load_token_cache()
+    app_auth = msal.PublicClientApplication(CLIENT_ID, authority=AUTHORITY, token_cache=cache)
+    result = app_auth.acquire_token_silent(SCOPES, account=None)
+    if not result:
+        flow = app_auth.initiate_device_flow(scopes=SCOPES)
+        if "user_code" not in flow:
+            raise RuntimeError("No se pudo iniciar device flow.")
+        print(f"[MSAL] Ve a {flow['verification_uri']} y usa el código: {flow['user_code']}")
+        result = app_auth.acquire_token_by_device_flow(flow)
+        if "access_token" not in result:
+            raise RuntimeError(f"Error autenticación: {result}")
+    _save_token_cache(cache)
+    return result["access_token"]
+
+# ===== Graph helpers =====
+GRAPH = "https://graph.microsoft.com/v1.0"
+
+def encode_sharing_url(u: str) -> str:
+    b = base64.urlsafe_b64encode(u.encode("utf-8")).decode("utf-8").rstrip("=")
+    return f"u!{b}"
+
+def get_drive_item_from_share(sharing_url: str, access_token: str):
+    encoded = encode_sharing_url(sharing_url)
+    r = requests.get(
+        f"{GRAPH}/shares/{encoded}/driveItem",
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()  # contiene id, name, etc.
+
+def get_used_range_values(item_id: str, sheet_name: str, access_token: str):
+    # Devuelve el rango usado de la hoja como texto (más seguro para mensajes)
+    url = f"{GRAPH}/drive/items/{item_id}/workbook/worksheets('{sheet_name}')/usedRange(valuesOnly=true)?$select=text,address"
+    r = requests.get(url, headers={"Authorization": f"Bearer {access_token}"}, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    return data.get("text", [])
+
+def get_table_rows(item_id: str, table_name: str, access_token: str):
+    url = f"{GRAPH}/drive/items/{item_id}/workbook/tables('{table_name}')/rows"
+    r = requests.get(url, headers={"Authorization": f"Bearer {access_token}"}, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    rows = []
+    for row in data.get("value", []):
+        if row.get("values"):
+            rows.append(row["values"][0])
+    return rows
+
+def format_row_message(headers, last_row):
+    if USE_MARKDOWN:
+        if headers and len(headers) == len(last_row):
+            lines = [f"**{h}**: {v}" for h, v in zip(headers, last_row)]
+            return "🟢 Último registro agregado:\n" + "\n".join(lines)
+        return "🟢 Último registro agregado:\n" + ", ".join(map(str, last_row))
+    else:
+        if headers and len(headers) == len(last_row):
+            lines = [f"{h}: {v}" for h, v in zip(headers, last_row)]
+            return "Último registro agregado:\n" + "\n".join(lines)
+        return "Último registro agregado:\n" + ", ".join(map(str, last_row))
+
+def send_telegram_message(text: str):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "Markdown" if USE_MARKDOWN else None
     }
-    r = requests.post(token_url, data=data, timeout=20)
-    if r.status_code != 200:
-        app.logger.error(f"Token error {r.status_code}: {r.text}")
-        raise RuntimeError("No se obtuvo token de Azure AD.")
-    return r.json()["access_token"]
+    r = requests.post(url, json=payload, timeout=20)
+    r.raise_for_status()
+    return r.json()
 
-def share_id_from_url(url: str) -> str:
-    encoded = base64.urlsafe_b64encode(url.encode("utf-8")).decode("utf-8").rstrip("=")
-    return f"u!{encoded}"
+# ===== Acción principal: leer última fila y enviar =====
+def read_last_row_and_message():
+    token = acquire_token()
+    item = get_drive_item_from_share(EXCEL_SHARE_URL, token)
+    item_id = item.get("id")
+    if not item_id:
+        raise RuntimeError("No se obtuvo item.id del enlace compartido.")
 
-def descargar_excel_por_share_url(share_url: str, destino_local="temp.xlsx"):
-    token = get_access_token()
-    headers = {"Authorization": f"Bearer {token}"}
-    share_id = share_id_from_url(share_url)
-    api = f"https://graph.microsoft.com/v1.0/shares/{share_id}/driveItem/content"
-    r = requests.get(api, headers=headers, timeout=30)
-    if r.status_code != 200:
-        app.logger.error(f"Descarga error {r.status_code}: {r.text}")
-        raise RuntimeError(f"No se pudo descargar el Excel (HTTP {r.status_code}).")
-    with open(destino_local, "wb") as f:
-        f.write(r.content)
-    return destino_local
+    if TABLE_NAME:
+        rows = get_table_rows(item_id, TABLE_NAME, token)
+        if not rows:
+            raise RuntimeError("La tabla no devolvió filas.")
+        last_row = rows[-1]
+        headers = rows[0] if len(rows) > 1 else []
+    elif SHEET_NAME:
+        values = get_used_range_values(item_id, SHEET_NAME, token)
+        if not values:
+            raise RuntimeError("La hoja no devolvió valores.")
+        headers = values[0] if len(values) >= 1 else []
+        last_row = values[-1]
+    else:
+        raise RuntimeError("Configura SHEET_NAME o TABLE_NAME.")
 
-def formato_ultima_fila(ruta_local_excel: str) -> str:
-    # Leer Excel con pandas y tomar la última fila "real"
-    df = pd.read_excel(ruta_local_excel)  # requiere openpyxl para .xlsx
-    # Quitar filas completamente vacías (si las hubiera)
-    df_clean = df.dropna(how="all")
-    if df_clean.empty:
-        return "📊 El Excel no tiene datos."
-    ultima = df_clean.tail(1).iloc[0]
+    msg = format_row_message(headers, last_row)
+    send_telegram_message(msg)
+    return msg
 
-    # Construir un mensaje con todas las columnas de la última fila
-    lineas = []
-    for col in df_clean.columns:
-        val = ultima[col]
-        # Convertir NaN a vacío y tipos a string bonitos
-        if pd.isna(val):
-            val = ""
-        elif isinstance(val, float):
-            # Quitar .0 cuando es entero
-            val = int(val) if val.is_integer() else round(val, 4)
-        lineas.append(f"- {col}: {val}")
-    mensaje = "✅ Nueva actualización (última fila del Excel):\n" + "\n".join(lineas)
-    return mensaje
+# ===== Webhook de Telegram: responde al 'OK' =====
+@app.route("/telegram-webhook", methods=["POST"])
+def telegram_webhook():
+    data = request.get_json(force=True) or {}
+    msg = data.get("message") or data.get("edited_message") or {}
+    text = (msg.get("text") or "").strip()
 
-@app.route("/", methods=["POST"])
-def webhook():
-    data = request.get_json(silent=True) or {}
-    msg = data.get("message") or data.get("edited_message")
-    if not msg:
-        return "ok", 200
-
-    texto = (msg.get("text") or "").strip()
-    lower = texto.lower()
-
-    # Tu lógica previa de "OK"
-    if lower == "ok":
-        original_text = msg.get("reply_to_message", {}).get("text", "")
-        contenido = f"✅ La tarea se completó con éxito.\n\n{original_text}" if original_text else "✅ La tarea se completó con éxito."
-        send_message(DESTINO_CHAT_ID, contenido)
-
-    # Nuevo comando: /reporte -> última fila
-    elif lower == "/reporte":
+    if text.upper() == ONLY_TRIGGER_WORD:
         try:
-            local = descargar_excel_por_share_url(ONEDRIVE_SHARE_URL)
-            mensaje = formato_ultima_fila(local)
-            send_message(DESTINO_CHAT_ID, mensaje)
+            preview = read_last_row_and_message()
+            return {"ok": True, "preview": preview}
         except Exception as e:
-            app.logger.exception("Error generando reporte")
-            send_message(DESTINO_CHAT_ID, f"❌ Error generando reporte: {e}")
-
-    return "ok", 200
-
-@app.route("/", methods=["GET"])
-def health():
-    return "up", 200
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+            # Si falla, responde al grupo con el error para depuración rápida
+            try:
+                send_telegram_message(f"⚠️ Error al leer/enviar: {e}")
+            except:
+                pass
+            return {"ok": False, "error": str(e)}, 500
+    else:
+        # Ignora otros mensajes o responde algo breve
+        return {"ok": True, "ignored": True}
