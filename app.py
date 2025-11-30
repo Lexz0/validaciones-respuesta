@@ -314,7 +314,7 @@ def read_last_row_and_message():
 
     if last_sig and current_sig == last_sig:
         # 2) Ya fue enviado: manda aviso SOLO al supergrupo respondiendo al último mensaje
-        notice = "ℹ️ No hay actualizaciones. Revisa el último mensaje enviado."
+        notice = "ℹ️ No hay actualizaciones. Revisa este último mensaje enviado."
         last_mid = _load_last_group_message_id()
         send_telegram_message(notice, chat_id=TELEGRAM_CHAT_ID, reply_to_message_id=(last_mid or None))
         return notice
@@ -332,12 +332,6 @@ def read_last_row_and_message():
     except:
         pass
     _save_last_signature(current_sig)
-
-    # Confirmación opcional al chat personal
-    if TELEGRAM_PERSONAL_CHAT_ID:
-        send_telegram_message("✅ Envío completado.\n\n" + msg, chat_id=TELEGRAM_PERSONAL_CHAT_ID)
-
-    return msg
 
 # ===== Confirmación basada en reply (texto plano) =====
 def send_confirmation_from_reply(msg):
