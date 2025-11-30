@@ -275,11 +275,11 @@ def build_message_with_fields(headers, last_row):
     lines.append("Se tiene una tarea asignada:")
     lines.append(f"📊 Agrupación: {agrupacion}")
     lines.append(f"🗓️ Mes planificado: {mes_planificado}")
-    lines.append(f"✅ Estatus: {estatus}")
+    lines.append(f"✅ Estatus: {dictamen/estatus}")
     lines.append("")  # línea en blanco
-    lines.append(f"🔢 Código de equipo: {codigo_equipo}")
-    lines.append(f"🎼 Instrumento: {instrumento}")
-    lines.append(f"⚙️ Ubicación: {ubicacion}")
+    lines.append(f"🔢 Código de equipo: {codigo_de_equipo}")
+    lines.append(f"🎼 Instrumento: {nombre/instrumento}")
+    lines.append(f"⚙️ Ubicación: {equipo-sistema-ubicacion}")
     lines.append(f"🏢 Departamento: {departamento}")
     lines.append(f"📝 Actividad: {actividad}")
 
