@@ -1,13 +1,15 @@
 
 import os
 import base64
+import threading
 import requests
 from flask import Flask, request
 
 # ===== Config =====
 CLIENT_ID = os.getenv("CLIENT_ID")
-AUTHORITY = os.getenv("AUTHORITY") or "https://login.microsoftonline.com/consumers"  # cuentas personales por defecto
-# Si editarás la hoja, Files.ReadWrite; si solo lees, Files.Read
+# Si tu OneDrive es personal, usa "consumers". Si es empresarial o no estás seguro, usa "common".
+AUTHORITY = os.getenv("AUTHORITY") or "https://login.microsoftonline.com/consumers"
+# Si sólo lees, puedes cambiar a ["Files.Read"]
 SCOPES = ["Files.ReadWrite"]
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -27,6 +29,9 @@ app = Flask(__name__)
 import msal
 TOKEN_CACHE_PATH = "/tmp/msal_cache.json"
 
+_auth_thread = None
+_auth_state = {"running": False, "message": None, "error": None}
+
 def _load_token_cache():
     cache = msal.SerializableTokenCache()
     if os.path.exists(TOKEN_CACHE_PATH):
@@ -39,45 +44,70 @@ def _save_token_cache(cache):
         with open(TOKEN_CACHE_PATH, "w") as f:
             f.write(cache.serialize())
 
+def _public_client(cache=None):
+    return msal.PublicClientApplication(CLIENT_ID, authority=AUTHORITY, token_cache=cache)
+
 def get_token_silent_only():
-    """
-    Usa SOLO el token existente en caché. Si no existe, falla.
-    Evita iniciar Device Flow dentro del webhook para no bloquear workers.
-    """
+    """Usa SOLO el token del caché. Si no existe, falla (no iniciar device flow aquí)."""
     cache = _load_token_cache()
-    app_auth = msal.PublicClientApplication(CLIENT_ID, authority=AUTHORITY, token_cache=cache)
+    app_auth = _public_client(cache)
     result = app_auth.acquire_token_silent(SCOPES, account=None)
     if not result or "access_token" not in result:
-        raise RuntimeError("Token no disponible. Ejecuta primero /init-auth y completa el Device Code.")
+        raise RuntimeError("Token no disponible. Ejecuta primero /init-auth, autoriza el código y vuelve a intentar.")
     return result["access_token"]
 
-def start_device_flow_and_cache():
-    """
-    Inicia el Device Flow y bloquea esta llamada hasta que completes la autorización.
-    Úsalo SOLO desde /init-auth (manual). Cachea el token para usos futuros.
-    """
-    cache = _load_token_cache()
-    app_auth = msal.PublicClientApplication(CLIENT_ID, authority=AUTHORITY, token_cache=cache)
+def _auth_worker(flow, cache):
+    """Hilo en segundo plano que bloquea hasta que completes el Device Flow."""
+    global _auth_state
+    try:
+        app_auth = _public_client(cache)
+        result = app_auth.acquire_token_by_device_flow(flow)  # bloquea hasta que completes
+        if "access_token" not in result:
+            _auth_state["error"] = f"Error de autenticación: {result}"
+        else:
+            _save_token_cache(cache)
+            _auth_state["message"] = "Autenticado y token cacheado."
+    except Exception as e:
+        _auth_state["error"] = str(e)
+    finally:
+        _auth_state["running"] = False
 
-    # Intento silencioso por si ya está cacheado
+def start_device_flow_async():
+    """Arranca el Device Flow sin bloquear la petición, devuelve código y URL."""
+    global _auth_thread, _auth_state
+    if _auth_state.get("running"):
+        return {"status": "in-progress", "message": "Device flow ya en progreso."}
+
+    cache = _load_token_cache()
+    app_auth = _public_client(cache)
+
+    # Intento silencioso por si ya hay token
     result = app_auth.acquire_token_silent(SCOPES, account=None)
     if result and "access_token" in result:
         _save_token_cache(cache)
-        return "Token ya disponible en caché."
+        return {"status": "ready", "message": "Token ya disponible en caché."}
 
     flow = app_auth.initiate_device_flow(scopes=SCOPES)
     if "user_code" not in flow:
-        raise RuntimeError(f"No se pudo iniciar device flow. Revisa CLIENT_ID, AUTHORITY, 'Allow public client flows' en Azure, y los scopes. Detalle: {flow}")
+        raise RuntimeError(
+            f"No se pudo iniciar device flow. Revisa CLIENT_ID, AUTHORITY ('consumers' vs 'common'), "
+            f"y que tu app en Azure tenga 'Allow public client flows' habilitado. Detalle: {flow}"
+        )
 
-    # Muestra el código en logs y también en la respuesta
-    print(f"[MSAL] Ve a {flow['verification_uri']} y usa el código: {flow['user_code']}")
-    # Bloquea hasta que completes
-    result = app_auth.acquire_token_by_device_flow(flow)
-    if "access_token" not in result:
-        raise RuntimeError(f"Error de autenticación: {result}")
+    # Arranca hilo que hará el polling sin bloquear este request
+    _auth_state = {"running": True, "message": None, "error": None}
+    _auth_thread = threading.Thread(target=_auth_worker, args=(flow, cache), daemon=True)
+    _auth_thread.start()
 
-    _save_token_cache(cache)
-    return "Autenticado y token cacheado."
+    # Devuelve datos para que autorices ya
+    return {
+        "status": "started",
+        "verification_uri": flow.get("verification_uri"),
+        "user_code": flow.get("user_code"),
+        "expires_in": flow.get("expires_in"),  # segundos
+        "interval": flow.get("interval"),      # polling interval sugerido
+        "note": "Ve a la URL y pega el código. Luego consulta /auth-status hasta ver 'Autenticado y token cacheado'.",
+    }
 
 # ===== Graph helpers =====
 GRAPH = "https://graph.microsoft.com/v1.0"
@@ -97,12 +127,11 @@ def get_drive_item_from_share(sharing_url: str, access_token: str):
     return r.json()  # contiene id, name, etc.
 
 def get_used_range_values(item_id: str, sheet_name: str, access_token: str):
-    # Devuelve el rango usado de la hoja como texto (string), ideal para mensajes
     url = f"{GRAPH}/drive/items/{item_id}/workbook/worksheets('{sheet_name}')/usedRange(valuesOnly=true)?$select=text,address"
     r = requests.get(url, headers={"Authorization": f"Bearer {access_token}"}, timeout=30)
     r.raise_for_status()
     data = r.json()
-    return data.get("text", [])  # [["h1","h2"], ["v1","v2"], ...]
+    return data.get("text", [])
 
 def get_table_rows(item_id: str, table_name: str, access_token: str):
     url = f"{GRAPH}/drive/items/{item_id}/workbook/tables('{table_name}')/rows"
@@ -112,7 +141,6 @@ def get_table_rows(item_id: str, table_name: str, access_token: str):
     rows = []
     for row in data.get("value", []):
         if row.get("values"):
-            # Cada row["values"] puede tener múltiples filas, tomamos la primera
             rows.append(row["values"][0])
     return rows
 
@@ -141,23 +169,20 @@ def send_telegram_message(text: str):
     return r.json()
 
 # ===== Acción principal: leer última fila y enviar =====
-def read_last_row_and_message():
-    # Usa SOLO el token silencioso del caché (no iniciar Device Flow aquí)
-    token = get_token_silent_only()
-
-    item = get_drive_item_from_share(EXCEL_SHARE_URL, token)
+def read_last_row_and_message_with_token(access_token: str):
+    item = get_drive_item_from_share(EXCEL_SHARE_URL, access_token)
     item_id = item.get("id")
     if not item_id:
         raise RuntimeError("No se obtuvo item.id del enlace compartido.")
 
     if TABLE_NAME:
-        rows = get_table_rows(item_id, TABLE_NAME, token)
+        rows = get_table_rows(item_id, TABLE_NAME, access_token)
         if not rows:
             raise RuntimeError("La tabla no devolvió filas.")
         last_row = rows[-1]
         headers = rows[0] if len(rows) > 1 else []
     elif SHEET_NAME:
-        values = get_used_range_values(item_id, SHEET_NAME, token)
+        values = get_used_range_values(item_id, SHEET_NAME, access_token)
         if not values:
             raise RuntimeError("La hoja no devolvió valores.")
         headers = values[0] if len(values) >= 1 else []
@@ -178,10 +203,10 @@ def telegram_webhook():
 
     if text.upper() == ONLY_TRIGGER_WORD:
         try:
-            preview = read_last_row_and_message()
+            token = get_token_silent_only()
+            preview = read_last_row_and_message_with_token(token)
             return {"ok": True, "preview": preview}
         except Exception as e:
-            # Responde al grupo con el error para depuración rápida
             try:
                 send_telegram_message(f"⚠️ Error al leer/enviar: {e}")
             except:
@@ -190,31 +215,56 @@ def telegram_webhook():
     else:
         return {"ok": True, "ignored": True}
 
-# ===== Endpoints de soporte para autenticación =====
+# ===== Endpoints de soporte =====
 @app.route("/init-auth", methods=["GET"])
 def init_auth():
-    """
-    Inicia el Device Flow y cachea el token.
-    Abre esta ruta manualmente en el navegador y completa el código que verás en logs.
-    """
+    """Inicia Device Flow en segundo plano y devuelve el código/URL de verificación."""
     try:
-        msg = start_device_flow_and_cache()
-        return {"ok": True, "message": msg}
+        payload = start_device_flow_async()
+        return {"ok": True, **payload}
     except Exception as e:
         return {"ok": False, "error": str(e)}, 500
 
+@app.route("/auth-status", methods=["GET"])
+def auth_status():
+    """Consulta el estado del Device Flow / token cacheado."""
+    global _auth_state
+    status = {
+        "running": _auth_state.get("running"),
+        "message": _auth_state.get("message"),
+        "error": _auth_state.get("error"),
+    }
+    # Además, intenta un silent para confirmar si ya hay token
+    try:
+        _ = get_token_silent_only()
+        status["token_ready"] = True
+    except Exception:
+        status["token_ready"] = False
+    return {"ok": True, "status": status}
+
 @app.route("/reset-auth", methods=["POST"])
 def reset_auth():
-    """
-    Borra la caché de MSAL por si se corrompe. Luego llama /init-auth de nuevo.
-    """
+    """Borra la caché de MSAL. Luego llama /init-auth para reautorizar."""
     try:
         if os.path.exists(TOKEN_CACHE_PATH):
             os.remove(TOKEN_CACHE_PATH)
+        # Reinicia estado
+        global _auth_state
+        _auth_state = {"running": False, "message": None, "error": None}
         return {"ok": True, "message": "Cache borrado. Llama /init-auth para reautorizar."}
     except Exception as e:
         return {"ok": False, "error": str(e)}, 500
 
 @app.route("/healthz", methods=["GET"])
 def healthz():
-    return {"ok": True, "status": "up"}
+    # Verifica variables básicas (sin revelar secretos)
+    cfg = {
+        "CLIENT_ID_set": bool(CLIENT_ID),
+        "AUTHORITY": AUTHORITY,
+        "TELEGRAM_BOT_TOKEN_set": bool(TELEGRAM_BOT_TOKEN),
+        "TELEGRAM_CHAT_ID_set": bool(TELEGRAM_CHAT_ID),
+        "EXCEL_SHARE_URL_set": bool(EXCEL_SHARE_URL),
+        "SHEET_NAME": SHEET_NAME,
+        "TABLE_NAME": TABLE_NAME,
+    }
+    return {"ok": True, "status": "up", "config": cfg}
