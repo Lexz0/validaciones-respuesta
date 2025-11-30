@@ -197,6 +197,33 @@ def send_telegram_message(text: str, chat_id: str = None):
 
 #NUEVO
 # --- reemplaza read_last_row_and_message() para usar el nuevo build y enviar a ambos chats ---
+
+def send_confirmation_from_reply(msg):
+    """
+    Envía al chat personal una confirmación basada en el mensaje al que se respondió con 'OK'.
+    msg: dict del Update.message
+    """
+    if not TELEGRAM_PERSONAL_CHAT_ID:
+        raise RuntimeError("Define TELEGRAM_PERSONAL_CHAT_ID para enviar la confirmación personal.")
+
+    reply = msg.get("reply_to_message") or {}
+    # El texto del original puede venir en 'text' o 'caption' si era media
+    original_text = reply.get("text") or reply.get("caption") or ""
+    if not original_text:
+        # fallback: si no hay texto, avisamos igual
+        original_text = "(mensaje original sin texto)"
+
+    # Quien confirmó
+    from_user = msg.get("from", {}) or {}
+    who = from_user.get("first_name") or from_user.get("username") or "alguien"
+
+    confirmation = f"✅ Tarea confirmada por {who}. Márcala como terminada.\n\n{original_text}"
+
+    # Envía a tu chat personal
+    send_telegram_message(confirmation, chat_id=TELEGRAM_PERSONAL_CHAT_ID)
+    return confirmation
+
+
 def read_last_row_and_message():
     token = get_token_silent_only()
 
@@ -371,27 +398,38 @@ def reset_auth():
 
 
 # --- reemplaza el webhook para usar dedup y solo 'message' ---
+
 @app.route("/telegram-webhook", methods=["POST"])
 def telegram_webhook():
     data = request.get_json(force=True) or {}
     update_id = data.get("update_id")
 
-    # idempotencia: evita reprocesar el mismo update
+    # Idempotencia: evita reprocesar el mismo update
     if isinstance(update_id, int) and _is_duplicate_update(update_id):
         return {"ok": True, "duplicate": True}
 
-    msg = data.get("message") or {}   # ⬅️ solo 'message', ignoramos 'edited_message'
+    msg = data.get("message") or {}   # solo 'message', ignoramos 'edited_message'
     text = (msg.get("text") or "").strip()
 
     if text.upper() == ONLY_TRIGGER_WORD:
         try:
+            # Si es reply a un mensaje, enviamos confirmación personal con el contenido original
+            if msg.get("reply_to_message"):
+                confirmation_preview = send_confirmation_from_reply(msg)
+                return {"ok": True, "preview": confirmation_preview}
+
+            # Si NO es reply (caso anterior): leer última fila y publicar + confirmar
             preview = read_last_row_and_message()
             return {"ok": True, "preview": preview}
+
         except Exception as e:
+            # Responde al grupo con el error para depuración rápida
             try:
-                send_telegram_message(f"⚠️ Error al leer/enviar: {e}", chat_id=TELEGRAM_CHAT_ID)
+                send_telegram_message(f"⚠️ Error al leer/enviar: {e}")
             except:
                 pass
             return {"ok": False, "error": str(e)}, 500
+
     else:
+        # Ignora otros textos
         return {"ok": True, "ignored": True}
