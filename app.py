@@ -252,7 +252,7 @@ def build_message_with_fields(headers, last_row):
     agrupacion      = row.get("agrupacion", "")
     mes_planificado = row.get("mes_planificado", row.get("mes", ""))
     dictamen_estatus = row.get("dictamen_estatus", row.get("status", ""))
-    codigo_equipo   = row.get("codigo_de_equipo", row.get("codigo_equipo", ""))
+    codigo_de_equipo   = row.get("codigo_de_equipo", row.get("codigo_de_equipo", ""))
     nombre_instrumento     = row.get("nombre_instrumento", "")
     equipo_sistema_ubicacion       = row.get("equipo_sistema_ubicacion", "")
     departamento    = row.get("departamento", "")
