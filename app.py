@@ -3,6 +3,7 @@ import os
 import base64
 import threading
 import requests
+import unicodedata
 from flask import Flask, request
 
 # ===== Config =====
@@ -43,6 +44,18 @@ def _save_token_cache(cache):
     if cache.has_state_changed:
         with open(TOKEN_CACHE_PATH, "w") as f:
             f.write(cache.serialize())
+
+def _normalize_header(h: str) -> str:
+    h = (h or "").strip().lower()
+    # quita acentos
+    h = "".join(c for c in unicodedata.normalize("NFD", h) if unicodedata.category(c) != "Mn")
+    # reemplaza espacios y signos comunes por _
+    for ch in [" ", "-", "/", ".", ":", ";"]:
+        h = h.replace(ch, "_")
+    return h
+
+
+
 
 def _public_client(cache=None):
     return msal.PublicClientApplication(CLIENT_ID, authority=AUTHORITY, token_cache=cache)
@@ -166,10 +179,14 @@ def format_row_message(headers, last_row):
             return "Último registro agregado:\n" + "\n".join(lines)
         return "Último registro agregado:\n" + ", ".join(map(str, last_row))
 
-def send_telegram_message(text: str):
+
+# --- reemplaza send_telegram_message para aceptar chat destino ---
+TELEGRAM_PERSONAL_CHAT_ID = os.getenv("TELEGRAM_PERSONAL_CHAT_ID")
+
+def send_telegram_message(text: str, chat_id: str = None):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
+        "chat_id": chat_id or TELEGRAM_CHAT_ID,
         "text": text,
     }
     if USE_MARKDOWN:
@@ -178,21 +195,24 @@ def send_telegram_message(text: str):
     r.raise_for_status()
     return r.json()
 
-# ===== Acción principal: leer última fila y enviar =====
-def read_last_row_and_message_with_token(access_token: str):
-    item = get_drive_item_from_share(EXCEL_SHARE_URL, access_token)
+#NUEVO
+# --- reemplaza read_last_row_and_message() para usar el nuevo build y enviar a ambos chats ---
+def read_last_row_and_message():
+    token = get_token_silent_only()
+
+    item = get_drive_item_from_share(EXCEL_SHARE_URL, token)
     item_id = item.get("id")
     if not item_id:
         raise RuntimeError("No se obtuvo item.id del enlace compartido.")
 
     if TABLE_NAME:
-        rows = get_table_rows(item_id, TABLE_NAME, access_token)
+        rows = get_table_rows(item_id, TABLE_NAME, token)
         if not rows:
             raise RuntimeError("La tabla no devolvió filas.")
         last_row = rows[-1]
         headers = rows[0] if len(rows) > 1 else []
     elif SHEET_NAME:
-        values = get_used_range_values(item_id, SHEET_NAME, access_token)
+        values = get_used_range_values(item_id, SHEET_NAME, token)
         if not values:
             raise RuntimeError("La hoja no devolvió valores.")
         headers = values[0] if len(values) >= 1 else []
@@ -200,9 +220,93 @@ def read_last_row_and_message_with_token(access_token: str):
     else:
         raise RuntimeError("Configura SHEET_NAME o TABLE_NAME.")
 
-    msg = format_row_message(headers, last_row)
-    send_telegram_message(msg)
+    # mensaje con formato exacto
+    msg = build_message_with_fields(headers, last_row)
+
+    # envía al grupo
+    send_telegram_message(msg, chat_id=TELEGRAM_CHAT_ID)
+
+    # confirmación a tu chat personal (si está configurado)
+    if TELEGRAM_PERSONAL_CHAT_ID:
+        send_telegram_message("✅ Envío completado.\n\n" + msg, chat_id=TELEGRAM_PERSONAL_CHAT_ID)
+
     return msg
+
+
+#NUEVA MADRE XDDD
+
+# --- NUEVO: dedup por update_id ---
+LAST_UPDATE_FILE = "/tmp/last_update_id"
+
+def _is_duplicate_update(update_id: int) -> bool:
+    try:
+        if os.path.exists(LAST_UPDATE_FILE):
+            with open(LAST_UPDATE_FILE, "r") as f:
+                last = int(f.read().strip())
+                if update_id <= last:
+                    return True
+        # guarda el nuevo id
+        with open(LAST_UPDATE_FILE, "w") as f:
+            f.write(str(update_id))
+    except Exception:
+        # si falla el archivo, no bloquees la ejecución
+        pass
+    return False
+
+
+#nueva madre 2
+
+# --- NUEVO: formato exacto del mensaje y menciones desde 'responsable' ---
+def build_message_with_fields(headers, last_row):
+    # mapea headers -> valores
+    if headers and len(headers) == len(last_row):
+        keys = [_normalize_header(h) for h in headers]
+        row = {k: v for k, v in zip(keys, last_row)}
+    else:
+        # fallback: sin encabezados claros, usa índices
+        row = {f"col_{i}": v for i, v in enumerate(last_row)}
+
+    # lee campos (ajusta estos nombres si en tu Excel difieren)
+    responsable = row.get("responsable", "")
+    agrupacion = row.get("agrupacion", "")
+    mes_planificado = row.get("mes_planificado", row.get("mes", ""))
+    estatus = row.get("estatus", row.get("status", ""))
+    codigo_equipo = row.get("codigo_de_equipo", row.get("codigo_equipo", ""))
+    instrumento = row.get("instrumento", "")
+    ubicacion = row.get("ubicacion", "")
+    departamento = row.get("departamento", "")
+    actividad = row.get("actividad", row.get("tarea", ""))
+
+    # generar menciones tipo @K @D a partir de "K,D" o "K, D"
+    mentions = []
+    for token in (responsable or "").replace(";", ",").split(","):
+        u = token.strip()
+        if not u:
+            continue
+        if not u.startswith("@"):
+            u = "@" + u
+        mentions.append(u)
+    mentions_line = " ".join(mentions) if mentions else ""
+
+    # cuerpo con tu formato
+    lines = []
+    if mentions_line:
+        lines.append(mentions_line)
+    lines.append("Se tiene una tarea asignada:")
+    lines.append(f"📊 Agrupación: {agrupacion}")
+    lines.append(f"🗓️ Mes planificado: {mes_planificado}")
+    lines.append(f"✅ Estatus: {estatus}")
+    lines.append("")  # línea en blanco
+    lines.append(f"🔢 Código de equipo: {codigo_equipo}")
+    lines.append(f"🎼 Instrumento: {instrumento}")
+    lines.append(f"⚙️ Ubicación: {ubicacion}")
+    lines.append(f"🏢 Departamento: {departamento}")
+    lines.append(f"📝 Actividad: {actividad}")
+
+    return "\n".join(lines)
+
+
+
 
 # ===== Webhook de Telegram: responde al 'OK' =====
 @app.route("/telegram-webhook", methods=["POST"])
@@ -265,16 +369,29 @@ def reset_auth():
     except Exception as e:
         return {"ok": False, "error": str(e)}, 500
 
-@app.route("/healthz", methods=["GET"])
-def healthz():
-    # Verifica variables básicas (sin revelar secretos)
-    cfg = {
-        "CLIENT_ID_set": bool(CLIENT_ID),
-        "AUTHORITY": AUTHORITY,
-        "TELEGRAM_BOT_TOKEN_set": bool(TELEGRAM_BOT_TOKEN),
-        "TELEGRAM_CHAT_ID_set": bool(TELEGRAM_CHAT_ID),
-        "EXCEL_SHARE_URL_set": bool(EXCEL_SHARE_URL),
-        "SHEET_NAME": SHEET_NAME,
-        "TABLE_NAME": TABLE_NAME,
-    }
-    return {"ok": True, "status": "up", "config": cfg}
+
+# --- reemplaza el webhook para usar dedup y solo 'message' ---
+@app.route("/telegram-webhook", methods=["POST"])
+def telegram_webhook():
+    data = request.get_json(force=True) or {}
+    update_id = data.get("update_id")
+
+    # idempotencia: evita reprocesar el mismo update
+    if isinstance(update_id, int) and _is_duplicate_update(update_id):
+        return {"ok": True, "duplicate": True}
+
+    msg = data.get("message") or {}   # ⬅️ solo 'message', ignoramos 'edited_message'
+    text = (msg.get("text") or "").strip()
+
+    if text.upper() == ONLY_TRIGGER_WORD:
+        try:
+            preview = read_last_row_and_message()
+            return {"ok": True, "preview": preview}
+        except Exception as e:
+            try:
+                send_telegram_message(f"⚠️ Error al leer/enviar: {e}", chat_id=TELEGRAM_CHAT_ID)
+            except:
+                pass
+            return {"ok": False, "error": str(e)}, 500
+    else:
+        return {"ok": True, "ignored": True}
