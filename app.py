@@ -173,7 +173,7 @@ def escape_markdown_v2(text: str) -> str:
     return "".join(out)
 
 # --- reemplaza send_telegram_message para aceptar chat destino y parse_mode ---
-TELEGRAM_PERSONAL_CHAT_ID = os.getenv("TELEGRAM_PERSONAL_CHAT_ID")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 def send_telegram_message(text: str, chat_id: str = None, parse_mode: str = None):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -213,8 +213,8 @@ def send_confirmation_from_reply(msg):
     Envía al chat personal una confirmación basada en el mensaje al que se respondió con 'OK'.
     msg: dict del Update.message
     """
-    if not TELEGRAM_PERSONAL_CHAT_ID:
-        raise RuntimeError("Define TELEGRAM_PERSONAL_CHAT_ID para enviar la confirmación personal.")
+    if not TELEGRAM_CHAT_ID:
+        raise RuntimeError("Define TELEGRAM_CHAT_ID para enviar la confirmación personal.")
     reply = msg.get("reply_to_message") or {}
     # El texto del original puede venir en 'text' o 'caption' si era media
     original_text = reply.get("text") or reply.get("caption") or ""
@@ -231,7 +231,7 @@ def send_confirmation_from_reply(msg):
     confirmation = f"✅ Tarea confirmada por {who_safe}. Márcala como terminada.\n\n{original_text_safe}"
 
     # Envía a tu chat personal con MarkdownV2
-    send_telegram_message(confirmation, chat_id=TELEGRAM_PERSONAL_CHAT_ID, parse_mode="MarkdownV2")
+    send_telegram_message(confirmation, chat_id=TELEGRAM_CHAT_ID, parse_mode="MarkdownV2")
     return confirmation
 
 # --- NUEVO: formato exacto del mensaje y menciones desde 'responsable' ---
@@ -316,8 +316,8 @@ def read_last_row_and_message():
     send_telegram_message(msg, chat_id=TELEGRAM_CHAT_ID)
 
     # confirmación a tu chat personal (si está configurado)
-    if TELEGRAM_PERSONAL_CHAT_ID:
-        send_telegram_message("✅ Envío completado.\n\n" + msg, chat_id=TELEGRAM_PERSONAL_CHAT_ID)
+    if TELEGRAM_CHAT_ID:
+        send_telegram_message("✅ Envío completado.\n\n" + msg, chat_id=TELEGRAM_CHAT_ID)
 
     return msg
 
