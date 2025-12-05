@@ -10,7 +10,7 @@ from flask import Flask, request
 # ===== Config =====
 CLIENT_ID = os.getenv("CLIENT_ID")
 AUTHORITY = os.getenv("AUTHORITY") or "https://login.microsoftonline.com/consumers"
-SCOPES = ["Files.ReadWrite"]
+SCOPES = ["Files.ReadWrite", "offline_access"]
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # supergrupo destino
@@ -30,7 +30,7 @@ app = Flask(__name__)
 
 # ===== MSAL (Device Code) =====
 import msal
-TOKEN_CACHE_PATH = "/tmp/msal_cache.json"
+TOKEN_CACHE_PATH = os.getenv("TOKEN_CACHE_PATH", "/data/msal_cache.json")
 _auth_thread = None
 _auth_state = {"running": False, "message": None, "error": None}
 
