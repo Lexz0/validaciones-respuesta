@@ -2,3 +2,5 @@ flask
 requests
 msal
 gunicorn
+msal==1.34.0
+upstash-redis==1.5.0
