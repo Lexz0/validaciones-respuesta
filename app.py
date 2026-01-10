@@ -12,7 +12,8 @@ from flask import Flask, request
 AZURE_CLIENT_ID = os.getenv("AZURE_CLIENT_ID") or os.getenv("CLIENT_ID")  # compat con tu nombre anterior
 TENANT_ID = os.getenv("TENANT_ID", "common")
 AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
-SCOPES = ["Files.ReadWrite", "offline_access"]
+#para permisos de excel: SCOPES
+SCOPES = ["User.Read", "Files.ReadWrite"]
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # supergrupo destino
