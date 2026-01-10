@@ -1,3 +1,4 @@
+
 import os
 import base64
 import threading
@@ -8,19 +9,21 @@ import hashlib
 from flask import Flask, request
 
 # ===== Config =====
-CLIENT_ID = os.getenv("CLIENT_ID")
-AUTHORITY = os.getenv("AUTHORITY") or "https://login.microsoftonline.com/consumers"
+AZURE_CLIENT_ID = os.getenv("AZURE_CLIENT_ID") or os.getenv("CLIENT_ID")  # compat con tu nombre anterior
+TENANT_ID = os.getenv("TENANT_ID", "common")
+AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
 SCOPES = ["Files.ReadWrite", "offline_access"]
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # supergrupo destino
+TELEGRAM_PERSONAL_CHAT_ID = os.getenv("TELEGRAM_PERSONAL_CHAT_ID")
+
 EXCEL_SHARE_URL = os.getenv("EXCEL_SHARE_URL")
 SHEET_NAME = os.getenv("SHEET_NAME")  # ej: "Hoja1"
 TABLE_NAME = os.getenv("TABLE_NAME")  # ej: "Tabla1"
-
 ONLY_TRIGGER_WORD = (os.getenv("ONLY_TRIGGER_WORD") or "OK").strip().upper()
 
-# ===== Persistencia local =====
+# ===== Persistencia (solo ids/firmas locales; tokens van a Redis) =====
 LAST_UPDATE_FILE = "/tmp/last_update_id"
 LAST_SENT_SIGNATURE_FILE = "/tmp/last_sent_signature"
 LAST_GROUP_MESSAGE_ID_FILE = "/tmp/last_group_message_id"
@@ -28,35 +31,40 @@ LAST_GROUP_MESSAGE_ID_FILE = "/tmp/last_group_message_id"
 # ===== Flask =====
 app = Flask(__name__)
 
-# ===== MSAL (Device Code) =====
+# ===== MSAL + caché persistente en Redis =====
 import msal
-TOKEN_CACHE_PATH = os.getenv("TOKEN_CACHE_PATH", "/data/msal_cache.json")
+from upstash_redis import Redis
+
+REDIS = Redis.from_env()  # usa UPSTASH_REDIS_REST_URL y UPSTASH_REDIS_REST_TOKEN
+CACHE_KEY = "msal_cache_default"
+
 _auth_thread = None
 _auth_state = {"running": False, "message": None, "error": None}
 
 def _load_token_cache():
     cache = msal.SerializableTokenCache()
-    if os.path.exists(TOKEN_CACHE_PATH):
-        with open(TOKEN_CACHE_PATH, "r") as f:
-            cache.deserialize(f.read())
+    try:
+        s = REDIS.get(CACHE_KEY)
+        if s:
+            cache.deserialize(s)
+    except Exception as e:
+        # No rompas el flujo si Redis falla puntualmente
+        print(f"[WARN] No se pudo cargar caché desde Redis: {e}")
     return cache
 
 def _save_token_cache(cache):
-    if cache.has_state_changed:
-        with open(TOKEN_CACHE_PATH, "w") as f:
-            f.write(cache.serialize())
-
-def _normalize_header(h: str) -> str:
-    h = (h or "").strip().lower()
-    # quita acentos
-    h = "".join(c for c in unicodedata.normalize("NFD", h) if unicodedata.category(c) != "Mn")
-    # reemplaza espacios y signos comunes por _
-    for ch in [" ", "-", "/", ".", ":", ";"]:
-        h = h.replace(ch, "_")
-    return h
+    try:
+        if cache.has_state_changed:
+            REDIS.set(CACHE_KEY, cache.serialize())
+    except Exception as e:
+        print(f"[WARN] No se pudo guardar caché en Redis: {e}")
 
 def _public_client(cache=None):
-    return msal.PublicClientApplication(CLIENT_ID, authority=AUTHORITY, token_cache=cache)
+    return msal.PublicClientApplication(
+        client_id=AZURE_CLIENT_ID,
+        authority=AUTHORITY,
+        token_cache=cache
+    )
 
 def get_token_silent_only():
     """
@@ -71,6 +79,8 @@ def get_token_silent_only():
     result = app_auth.acquire_token_silent(SCOPES, account=accounts[0])
     if not result or "access_token" not in result:
         raise RuntimeError("Silent token no disponible. Repite /init-auth o revisa AUTHORITY/SCOPES.")
+    # Podría haber renovación y cambios de caché → persistimos
+    _save_token_cache(cache)
     return result["access_token"]
 
 def _auth_worker(flow, cache):
@@ -94,22 +104,37 @@ def start_device_flow_async():
     global _auth_thread, _auth_state
     if _auth_state.get("running"):
         return {"status": "in-progress", "message": "Device flow ya en progreso."}
+
     cache = _load_token_cache()
     app_auth = _public_client(cache)
-    # Intento silencioso por si ya hay token
-    result = app_auth.acquire_token_silent(SCOPES, account=None)
-    if result and "access_token" in result:
-        _save_token_cache(cache)
-        return {"status": "ready", "message": "Token ya disponible en caché."}
+
+    # Intento silencioso por si ya hay token (ej. redeploy, reinicio, etc.)
+    accounts = app_auth.get_accounts()
+    if accounts:
+        result = app_auth.acquire_token_silent(SCOPES, account=accounts[0])
+        if result and "access_token" in result:
+            _save_token_cache(cache)
+            return {"status": "ready", "message": "Token ya disponible en caché."}
+
     flow = app_auth.initiate_device_flow(scopes=SCOPES)
     if "user_code" not in flow:
         raise RuntimeError(
-            f"No se pudo iniciar device flow. Revisa CLIENT_ID, AUTHORITY ('consumers' vs 'common'), "
+            f"No se pudo iniciar device flow. Revisa AZURE_CLIENT_ID, AUTHORITY ('consumers' vs 'common'), "
             f"y que tu app en Azure tenga 'Allow public client flows' habilitado. Detalle: {flow}"
         )
+
+    # Opcional: enviar el mensaje del device flow por Telegram para login inmediato
+    try:
+        df_msg = flow.get("message") or f"Visita {flow.get('verification_uri')} y usa el código {flow.get('user_code')}"
+        if TELEGRAM_BOT_TOKEN and TELEGRAM_PERSONAL_CHAT_ID:
+            _send_telegram_message(df_msg, chat_id=TELEGRAM_PERSONAL_CHAT_ID)
+    except Exception as e:
+        print(f"[WARN] No se pudo enviar mensaje de device flow por Telegram: {e}")
+
     _auth_state = {"running": True, "message": None, "error": None}
     _auth_thread = threading.Thread(target=_auth_worker, args=(flow, cache), daemon=True)
     _auth_thread.start()
+
     return {
         "status": "started",
         "verification_uri": flow.get("verification_uri"),
@@ -155,12 +180,7 @@ def get_table_rows(item_id: str, table_name: str, access_token: str):
     return rows
 
 # ===== Telegram (texto plano, sin parse_mode) =====
-TELEGRAM_PERSONAL_CHAT_ID = os.getenv("TELEGRAM_PERSONAL_CHAT_ID")
-
-def send_telegram_message(text: str, chat_id: str = None, reply_to_message_id: int = None):
-    """
-    Envía texto plano al chat indicado. Permite responder (reply) a un message_id.
-    """
+def _send_telegram_message(text: str, chat_id: str = None, reply_to_message_id: int = None):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": chat_id or TELEGRAM_CHAT_ID,
@@ -170,7 +190,6 @@ def send_telegram_message(text: str, chat_id: str = None, reply_to_message_id: i
     if reply_to_message_id:
         payload["reply_to_message_id"] = reply_to_message_id
         payload["allow_sending_without_reply"] = True
-
     r = requests.post(url, json=payload, timeout=20)
     try:
         r.raise_for_status()
@@ -191,6 +210,16 @@ def send_telegram_message(text: str, chat_id: str = None, reply_to_message_id: i
         raise
     return r.json()
 
+# ===== Normalización de encabezados =====
+def _normalize_header(h: str) -> str:
+    h = (h or "").strip().lower()
+    # quita acentos
+    h = "".join(c for c in unicodedata.normalize("NFD", h) if unicodedata.category(c) != "Mn")
+    # reemplaza espacios y signos comunes por _
+    for ch in [" ", "-", "/", ".", ":", ";"]:
+        h = h.replace(ch, "_")
+    return h
+
 # ===== Firma del último mensaje enviado =====
 def _compute_signature_from_row(headers, last_row) -> str:
     """
@@ -206,7 +235,7 @@ def _compute_signature_from_row(headers, last_row) -> str:
         payload = json.dumps(row_dict, ensure_ascii=False, sort_keys=True)
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
     except Exception:
-        return hashlib.sha256(("|".join(map(lambda x: "" if x is None else str(x), last_row))).encode("utf-8")).hexdigest()
+        return hashlib.sha256(("\n".join(map(lambda x: "" if x is None else str(x), last_row))).encode("utf-8")).hexdigest()
 
 def _load_last_signature() -> str:
     try:
@@ -248,15 +277,15 @@ def build_message_with_fields(headers, last_row):
     else:
         row = {f"col_{i}": v for i, v in enumerate(last_row)}
 
-    responsable     = row.get("responsable", "")
-    agrupacion      = row.get("agrupacion", "")
+    responsable = row.get("responsable", "")
+    agrupacion = row.get("agrupacion", "")
     mes_planificado = row.get("mes_planificado", row.get("mes", ""))
     dictamen_estatus = row.get("dictamen_estatus", row.get("status", ""))
-    codigo_de_equipo   = row.get("codigo_de_equipo", row.get("codigo_de_equipo", ""))
-    nombre_instrumento     = row.get("nombre_instrumento", "")
-    equipo_sistema_ubicacion       = row.get("equipo_sistema_ubicacion", "")
-    departamento    = row.get("departamento", "")
-    actividad       = row.get("actividad", row.get("tarea", ""))
+    codigo_de_equipo = row.get("codigo_de_equipo", row.get("codigo_de_equipo", ""))
+    nombre_instrumento = row.get("nombre_instrumento", "")
+    equipo_sistema_ubicacion = row.get("equipo_sistema_ubicacion", "")
+    departamento = row.get("departamento", "")
+    actividad = row.get("actividad", row.get("tarea", ""))
 
     # menciones
     mentions = []
@@ -282,7 +311,6 @@ def build_message_with_fields(headers, last_row):
     lines.append(f"⚙️ Ubicación: {equipo_sistema_ubicacion}")
     lines.append(f"🏢 Departamento: {departamento}")
     lines.append(f"📝 Actividad: {actividad}")
-
     return "\n".join(lines)
 
 # ===== Lectura y envío con verificación de duplicado + reply =====
@@ -316,13 +344,12 @@ def read_last_row_and_message():
         # 2) Ya fue enviado: manda aviso SOLO al supergrupo respondiendo al último mensaje
         notice = "ℹ️ No hay actualizaciones. Revisa este último mensaje enviado."
         last_mid = _load_last_group_message_id()
-        send_telegram_message(notice, chat_id=TELEGRAM_CHAT_ID, reply_to_message_id=(last_mid or None))
+        _send_telegram_message(notice, chat_id=TELEGRAM_CHAT_ID, reply_to_message_id=(last_mid or None))
         return notice
 
     # 3) Es nuevo: construye mensaje y publícalo
     msg = build_message_with_fields(headers, last_row)
-    send_resp = send_telegram_message(msg, chat_id=TELEGRAM_CHAT_ID)
-
+    send_resp = _send_telegram_message(msg, chat_id=TELEGRAM_CHAT_ID)
     # Guarda el message_id y la firma
     try:
         # Bot API devuelve {"ok":true,"result":{"message_id":...}}
@@ -331,6 +358,7 @@ def read_last_row_and_message():
             _save_last_group_message_id(message_id)
     except:
         pass
+
     _save_last_signature(current_sig)
 
 # ===== Confirmación basada en reply (texto plano) =====
@@ -340,15 +368,17 @@ def send_confirmation_from_reply(msg):
     """
     if not TELEGRAM_PERSONAL_CHAT_ID:
         raise RuntimeError("Define TELEGRAM_PERSONAL_CHAT_ID para enviar la confirmación personal.")
+
     reply = msg.get("reply_to_message") or {}
     original_text = reply.get("text") or reply.get("caption") or ""
     if not original_text:
         original_text = "(mensaje original sin texto)"
+
     from_user = msg.get("from", {}) or {}
     who = from_user.get("first_name") or from_user.get("username") or "alguien"
 
     confirmation = f"✅ Tarea confirmada por {who}. Márcala como terminada.\n\n{original_text}"
-    send_telegram_message(confirmation, chat_id=TELEGRAM_PERSONAL_CHAT_ID)
+    _send_telegram_message(confirmation, chat_id=TELEGRAM_PERSONAL_CHAT_ID)
     return confirmation
 
 # ===== Dedup por update_id =====
@@ -392,8 +422,12 @@ def auth_status():
 @app.route("/reset-auth", methods=["POST"])
 def reset_auth():
     try:
-        if os.path.exists(TOKEN_CACHE_PATH):
-            os.remove(TOKEN_CACHE_PATH)
+        # Limpia la caché en Redis
+        try:
+            REDIS.delete(CACHE_KEY)
+        except Exception as e:
+            print(f"[WARN] No se pudo borrar cache en Redis: {e}")
+
         global _auth_state
         _auth_state = {"running": False, "message": None, "error": None}
         return {"ok": True, "message": "Cache borrado. Llama /init-auth para reautorizar."}
@@ -418,13 +452,14 @@ def telegram_webhook():
             if msg.get("reply_to_message"):
                 confirmation_preview = send_confirmation_from_reply(msg)
                 return {"ok": True, "preview": confirmation_preview}
+
             # Si NO es reply: verificar cambios y publicar o avisar
             preview = read_last_row_and_message()
             return {"ok": True, "preview": preview}
         except Exception as e:
             # Responde al grupo con el error para depuración rápida (texto plano)
             try:
-                send_telegram_message(f"⚠️ Error al leer/enviar: {str(e)}", chat_id=TELEGRAM_CHAT_ID)
+                _send_telegram_message(f"⚠️ Error al leer/enviar: {str(e)}", chat_id=TELEGRAM_CHAT_ID)
             except:
                 pass
             return {"ok": False, "error": str(e)}, 500
