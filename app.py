@@ -8,6 +8,20 @@ import json
 import hashlib
 from flask import Flask, request
 
+
+# --- arriba, junto a Config ---
+from urllib.parse import urlparse
+
+EXCEL_SHARE_URL = os.getenv("EXCEL_SHARE_URL")
+TENANT_ID = os.getenv("TENANT_ID", "common")
+
+# Si el enlace es consumer (1drv.ms / onedrive.live.com), fuerzo 'consumers'
+_host = urlparse(EXCEL_SHARE_URL or "").netloc.lower()
+_is_consumer = ("1drv.ms" in _host) or ("onedrive.live.com" in _host)
+
+AUTHORITY = f"https://login.microsoftonline.com/{'consumers' if _is_consumer else TENANT_ID}"
+
+
 # ===== Config =====
 AZURE_CLIENT_ID = os.getenv("AZURE_CLIENT_ID") or os.getenv("CLIENT_ID")  # compat con tu nombre anterior
 TENANT_ID = os.getenv("TENANT_ID", "common")
