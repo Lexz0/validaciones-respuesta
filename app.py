@@ -1,4 +1,3 @@
-
 import os
 import base64
 import threading
@@ -6,41 +5,37 @@ import requests
 import unicodedata
 import json
 import hashlib
-from flask import Flask, request
-
-
-# --- arriba, junto a Config ---
 from urllib.parse import urlparse
-
+from flask import Flask, request
 
 # ===== Config =====
 AZURE_CLIENT_ID = os.getenv("AZURE_CLIENT_ID") or os.getenv("CLIENT_ID")  # compat con tu nombre anterior
-EXCEL_SHARE_URL = os.getenv("EXCEL_SHARE_URL")
+
+# Enlace compartido de Excel (OneDrive/SharePoint)
+EXCEL_SHARE_URL = os.getenv("EXCEL_SHARE_URL", "")
+
+# TENANT_ID robusto: si está vacío en env, usa 'common'
 TENANT_ID = os.getenv("TENANT_ID") or "common"
-AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
-#para permisos de excel: SCOPES
-SCOPES = ["User.Read", "Files.ReadWrite"]
-
-####
-TENANT_ID = os.getenv("TENANT_ID", "common")
-
 
 # Detecta si el share es de OneDrive personal (consumer: 1drv.ms / onedrive.live.com)
-_host = urlparse(EXCEL_SHARE_URL).netloc.lower()
-_is_consumer = ("1drv.ms" in _host) or ("onedrive.live.com" in _host)
-AUTHORITY = f"https://login.microsoftonline.com/{'consumers' if _is_consumer else TENANT_ID}"
+_share_host = urlparse(EXCEL_SHARE_URL).netloc.lower()
+IS_CONSUMER = ("1drv.ms" in _share_host) or ("onedrive.live.com" in _share_host)
 
+# Authority: consumidores para 1drv.ms; de lo contrario, usar TENANT_ID/common
+AUTHORITY = f"https://login.microsoftonline.com/{'consumers' if IS_CONSUMER else TENANT_ID}"
+
+# Scopes solo de Graph (sin openid/profile/offline_access)
+SCOPES = ["User.Read", "Files.ReadWrite"]
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # supergrupo destino
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")          # supergrupo destino
 TELEGRAM_PERSONAL_CHAT_ID = os.getenv("TELEGRAM_PERSONAL_CHAT_ID")
 
-EXCEL_SHARE_URL = os.getenv("EXCEL_SHARE_URL")
-SHEET_NAME = os.getenv("SHEET_NAME")  # ej: "Hoja1"
-TABLE_NAME = os.getenv("TABLE_NAME")  # ej: "Tabla1"
+SHEET_NAME = os.getenv("SHEET_NAME")   # ej: "Hoja1"
+TABLE_NAME = os.getenv("TABLE_NAME")   # ej: "Tabla1"
 ONLY_TRIGGER_WORD = (os.getenv("ONLY_TRIGGER_WORD") or "OK").strip().upper()
 
-# ===== Persistencia (solo ids/firmas locales; tokens van a Redis) =====
+# ===== Persistencia local (ids/firmas). Los tokens van a Redis =====
 LAST_UPDATE_FILE = "/tmp/last_update_id"
 LAST_SENT_SIGNATURE_FILE = "/tmp/last_sent_signature"
 LAST_GROUP_MESSAGE_ID_FILE = "/tmp/last_group_message_id"
@@ -65,7 +60,6 @@ def _load_token_cache():
         if s:
             cache.deserialize(s)
     except Exception as e:
-        # No rompas el flujo si Redis falla puntualmente
         print(f"[WARN] No se pudo cargar caché desde Redis: {e}")
     return cache
 
@@ -83,32 +77,24 @@ def _public_client(cache=None):
         token_cache=cache
     )
 
-
 def get_token_silent_only():
     cache = _load_token_cache()
     app_auth = _public_client(cache)
-
-    scopes = SCOPES  # asegúrate que solo sean de Graph, ej. ["User.Read", "Files.ReadWrite"]
+    scopes = SCOPES
 
     accounts = app_auth.get_accounts()
-    # Log opcional para diagnóstico:
-    # print(f"[DEBUG] Accounts en caché: {[(a.get('home_account_id'), a.get('username')) for a in accounts]}")
-
     result = None
     if accounts:
         result = app_auth.acquire_token_silent(scopes, account=accounts[0])
-
-    # Si no hay cuentas o el silent no devolvió token, intenta sin especificar account
     if not result or "access_token" not in result:
+        # Fallback sin account: MSAL elige la cuenta desde la caché
         result = app_auth.acquire_token_silent(scopes, account=None)
 
     if not result or "access_token" not in result:
         raise RuntimeError("Silent token no disponible. Repite /init-auth o revisa AUTHORITY/SCOPES/consent.")
 
-    # Persistir cambios si MSAL actualizó la caché (refresh token usado, etc.)
     _save_token_cache(cache)
     return result["access_token"]
-
 
 def _auth_worker(flow, cache):
     """Hilo en segundo plano que bloquea hasta que completes el Device Flow."""
@@ -129,6 +115,7 @@ def _auth_worker(flow, cache):
 def start_device_flow_async():
     """Arranca el Device Flow sin bloquear la petición, devuelve el código y la URL."""
     global _auth_thread, _auth_state
+
     if _auth_state.get("running"):
         return {"status": "in-progress", "message": "Device flow ya en progreso."}
 
@@ -146,11 +133,11 @@ def start_device_flow_async():
     flow = app_auth.initiate_device_flow(scopes=SCOPES)
     if "user_code" not in flow:
         raise RuntimeError(
-            f"No se pudo iniciar device flow. Revisa AZURE_CLIENT_ID, AUTHORITY ('consumers' vs 'common'), "
-            f"y que tu app en Azure tenga 'Allow public client flows' habilitado. Detalle: {flow}"
+            f"No se pudo iniciar device flow. Revisa AZURE_CLIENT_ID y AUTHORITY "
+            f"('consumers' vs '{TENANT_ID}'), y habilita 'Allow public client flows' en la app. Detalle: {flow}"
         )
 
-    # Opcional: enviar el mensaje del device flow por Telegram para login inmediato
+    # (Opcional) enviar el mensaje del device flow por Telegram para login inmediato
     try:
         df_msg = flow.get("message") or f"Visita {flow.get('verification_uri')} y usa el código {flow.get('user_code')}"
         if TELEGRAM_BOT_TOKEN and TELEGRAM_PERSONAL_CHAT_ID:
@@ -178,29 +165,23 @@ def encode_sharing_url(u: str) -> str:
     b = base64.urlsafe_b64encode(u.encode("utf-8")).decode("utf-8").rstrip("=")
     return f"u!{b}"
 
-
 def get_drive_item_from_share(sharing_url: str, access_token: str):
     """
     Resuelve el driveItem a partir de un enlace compartido (share URL) de OneDrive/SharePoint.
     - 'sharing_url' es el enlace tal cual (ej.: https://1drv.ms/... o https://<tenant>-my.sharepoint.com/...)
     - 'access_token' debe ser un JWT válido de Microsoft Graph.
-
-    Devuelve: dict (JSON de driveItem)
-    Lanza: RuntimeError si falta token o requests.HTTPError si Graph devuelve error.
     """
-    # Verificación defensiva: no hagas la llamada si el token está vacío
     if not access_token or not access_token.strip():
         raise RuntimeError("No hay access_token para llamar a Graph.")
 
     encoded = encode_sharing_url(sharing_url)
-
     r = requests.get(
-        f"https://graph.microsoft.com/v1.0/shares/{encoded}/driveItem",
+        f"{GRAPH}/shares/{encoded}/driveItem",
         headers={
             "Authorization": f"Bearer {access_token}",
-            # Redime el enlace compartido para otorgar acceso como si se abriera en el navegador:
-            # (puedes usar 'redeemSharingLinkIfNecessary' si prefieres acceso solo para esta petición)
+            # Redime el enlace compartido; similar a abrirlo en navegador para aceptar el gesto de compartir:
             "Prefer": "redeemSharingLink"
+            # Alternativa temporal: "redeemSharingLinkIfNecessary"
         },
         timeout=30,
     )
@@ -236,11 +217,11 @@ def _send_telegram_message(text: str, chat_id: str = None, reply_to_message_id: 
     if reply_to_message_id:
         payload["reply_to_message_id"] = reply_to_message_id
         payload["allow_sending_without_reply"] = True
+
     r = requests.post(url, json=payload, timeout=20)
     try:
         r.raise_for_status()
     except Exception as e:
-        # Error también en texto plano
         try:
             requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
@@ -251,7 +232,7 @@ def _send_telegram_message(text: str, chat_id: str = None, reply_to_message_id: 
                 },
                 timeout=10
             )
-        except:
+        except Exception:
             pass
         raise
     return r.json()
@@ -259,19 +240,13 @@ def _send_telegram_message(text: str, chat_id: str = None, reply_to_message_id: 
 # ===== Normalización de encabezados =====
 def _normalize_header(h: str) -> str:
     h = (h or "").strip().lower()
-    # quita acentos
-    h = "".join(c for c in unicodedata.normalize("NFD", h) if unicodedata.category(c) != "Mn")
-    # reemplaza espacios y signos comunes por _
+    h = "".join(c for c in unicodedata.normalize("NFD", h) if unicodedata.category(c) != "Mn")  # quita acentos
     for ch in [" ", "-", "/", ".", ":", ";"]:
         h = h.replace(ch, "_")
     return h
 
 # ===== Firma del último mensaje enviado =====
 def _compute_signature_from_row(headers, last_row) -> str:
-    """
-    Crea una firma estable (hash) del contenido publicado.
-    Si cambia cualquier celda, cambia la firma.
-    """
     try:
         if headers and len(headers) == len(last_row):
             keys = [_normalize_header(h) for h in headers]
@@ -288,7 +263,7 @@ def _load_last_signature() -> str:
         if os.path.exists(LAST_SENT_SIGNATURE_FILE):
             with open(LAST_SENT_SIGNATURE_FILE, "r") as f:
                 return f.read().strip()
-    except:
+    except Exception:
         pass
     return ""
 
@@ -296,14 +271,14 @@ def _save_last_signature(sig: str):
     try:
         with open(LAST_SENT_SIGNATURE_FILE, "w") as f:
             f.write(sig)
-    except:
+    except Exception:
         pass
 
 def _save_last_group_message_id(message_id: int):
     try:
         with open(LAST_GROUP_MESSAGE_ID_FILE, "w") as f:
             f.write(str(message_id))
-    except:
+    except Exception:
         pass
 
 def _load_last_group_message_id() -> int:
@@ -311,7 +286,7 @@ def _load_last_group_message_id() -> int:
         if os.path.exists(LAST_GROUP_MESSAGE_ID_FILE):
             with open(LAST_GROUP_MESSAGE_ID_FILE, "r") as f:
                 return int(f.read().strip())
-    except:
+    except Exception:
         pass
     return 0
 
@@ -360,7 +335,6 @@ def build_message_with_fields(headers, last_row):
     return "\n".join(lines)
 
 # ===== Lectura y envío con verificación de duplicado + reply =====
-
 def read_last_row_and_message():
     # 1) Obtiene el token una sola vez
     access_token = get_token_silent_only()
@@ -390,6 +364,7 @@ def read_last_row_and_message():
     # 4) Idempotencia por firma
     current_sig = _compute_signature_from_row(headers, last_row)
     last_sig = _load_last_signature()
+
     if last_sig and current_sig == last_sig:
         notice = "ℹ️ No hay actualizaciones. Revisa este último mensaje enviado."
         last_mid = _load_last_group_message_id()
@@ -413,7 +388,6 @@ def read_last_row_and_message():
 
     _save_last_signature(current_sig)
     return "Mensaje enviado"
-
 
 # ===== Confirmación basada en reply (texto plano) =====
 def send_confirmation_from_reply(msg):
@@ -449,33 +423,6 @@ def _is_duplicate_update(update_id: int) -> bool:
         pass
     return False
 
-
-def get_drive_item_from_share(sharing_url: str, access_token: str):
-    """
-    Resuelve el driveItem a partir de un enlace compartido.
-    """
-    if not access_token or not access_token.strip():
-        # Esto evita mandar Authorization vacío y nos da un mensaje claro.
-        raise RuntimeError("No hay access_token para llamar a Graph.")
-
-    encoded = encode_sharing_url(sharing_url)
-
-    # DEBUG opcional: ver que el token no esté vacío y su longitud
-    # print(f"[DEBUG] access_token length: {len(access_token)}")
-    # print(f"[DEBUG] encoded share: {encoded}")
-
-    r = requests.get(
-        f"https://graph.microsoft.com/v1.0/shares/{encoded}/driveItem",
-        headers={
-            "Authorization": f"Bearer {access_token}",
-            "Prefer": "redeemSharingLink",  # o 'redeemSharingLinkIfNecessary'
-        },
-        timeout=30,
-    )
-    r.raise_for_status()
-    return r.json()
-
-
 # ===== Endpoints =====
 @app.route("/init-auth", methods=["GET"])
 def init_auth():
@@ -503,12 +450,10 @@ def auth_status():
 @app.route("/reset-auth", methods=["POST"])
 def reset_auth():
     try:
-        # Limpia la caché en Redis
         try:
             REDIS.delete(CACHE_KEY)
         except Exception as e:
             print(f"[WARN] No se pudo borrar cache en Redis: {e}")
-
         global _auth_state
         _auth_state = {"running": False, "message": None, "error": None}
         return {"ok": True, "message": "Cache borrado. Llama /init-auth para reautorizar."}
@@ -538,10 +483,9 @@ def telegram_webhook():
             preview = read_last_row_and_message()
             return {"ok": True, "preview": preview}
         except Exception as e:
-            # Responde al grupo con el error para depuración rápida (texto plano)
             try:
                 _send_telegram_message(f"⚠️ Error al leer/enviar: {str(e)}", chat_id=TELEGRAM_CHAT_ID)
-            except:
+            except Exception:
                 pass
             return {"ok": False, "error": str(e)}, 500
     else:
@@ -552,13 +496,26 @@ def telegram_webhook():
 def who_am_i():
     access_token = get_token_silent_only()
     r = requests.get(
-        "https://graph.microsoft.com/v1.0/me",
+        f"{GRAPH}/me",
         headers={"Authorization": f"Bearer {access_token}"},
         timeout=30
     )
     try:
         r.raise_for_status()
     except Exception as e:
-        # Devuelve el cuerpo para depurar scope/consent/authority
         return {"ok": False, "error": str(e), "body": r.text}, r.status_code
     return r.json(), 200
+
+@app.get("/diag")
+def diag():
+    try:
+        access_token = get_token_silent_only()
+        return {
+            "authority": AUTHORITY,
+            "token_len": len(access_token),
+            "scopes": SCOPES,
+            "share_host": _share_host,
+            "is_consumer": IS_CONSUMER
+        }, 200
+    except Exception as e:
+        return {"authority": AUTHORITY, "error": str(e)}, 500
