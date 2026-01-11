@@ -67,22 +67,32 @@ def _public_client(cache=None):
         token_cache=cache
     )
 
+
 def get_token_silent_only():
-    """
-    Usa el token del caché con account explícito.
-    Si no hay accounts en caché o silent falla, lanza error claro.
-    """
     cache = _load_token_cache()
     app_auth = _public_client(cache)
+
+    scopes = SCOPES  # asegúrate que solo sean de Graph, ej. ["User.Read", "Files.ReadWrite"]
+
     accounts = app_auth.get_accounts()
-    if not accounts:
-        raise RuntimeError("No hay cuentas en caché. Ejecuta /init-auth y autoriza, luego intenta de nuevo.")
-    result = app_auth.acquire_token_silent(SCOPES, account=accounts[0])
+    # Log opcional para diagnóstico:
+    # print(f"[DEBUG] Accounts en caché: {[(a.get('home_account_id'), a.get('username')) for a in accounts]}")
+
+    result = None
+    if accounts:
+        result = app_auth.acquire_token_silent(scopes, account=accounts[0])
+
+    # Si no hay cuentas o el silent no devolvió token, intenta sin especificar account
     if not result or "access_token" not in result:
-        raise RuntimeError("Silent token no disponible. Repite /init-auth o revisa AUTHORITY/SCOPES.")
-    # Podría haber renovación y cambios de caché → persistimos
+        result = app_auth.acquire_token_silent(scopes, account=None)
+
+    if not result or "access_token" not in result:
+        raise RuntimeError("Silent token no disponible. Repite /init-auth o revisa AUTHORITY/SCOPES/consent.")
+
+    # Persistir cambios si MSAL actualizó la caché (refresh token usado, etc.)
     _save_token_cache(cache)
     return result["access_token"]
+
 
 def _auth_worker(flow, cache):
     """Hilo en segundo plano que bloquea hasta que completes el Device Flow."""
