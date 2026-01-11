@@ -329,21 +329,26 @@ def build_message_with_fields(headers, last_row):
     return "\n".join(lines)
 
 # ===== Lectura y envío con verificación de duplicado + reply =====
+
 def read_last_row_and_message():
-    token = get_token_silent_only()
-    item = get_drive_item_from_share(EXCEL_SHARE_URL, token)
+    # 1) Obtiene el token una sola vez
+    access_token = get_token_silent_only()
+
+    # 2) Resuelve el driveItem del enlace compartido
+    item = get_drive_item_from_share(EXCEL_SHARE_URL, access_token)
     item_id = item.get("id")
     if not item_id:
         raise RuntimeError("No se obtuvo item.id del enlace compartido.")
 
+    # 3) Lee filas desde tabla u hoja
     if TABLE_NAME:
-        rows = get_table_rows(item_id, TABLE_NAME, token)
+        rows = get_table_rows(item_id, TABLE_NAME, access_token)
         if not rows:
             raise RuntimeError("La tabla no devolvió filas.")
         last_row = rows[-1]
         headers = rows[0] if len(rows) > 1 else []
     elif SHEET_NAME:
-        values = get_used_range_values(item_id, SHEET_NAME, token)
+        values = get_used_range_values(item_id, SHEET_NAME, access_token)
         if not values:
             raise RuntimeError("La hoja no devolvió valores.")
         headers = values[0] if len(values) >= 1 else []
@@ -351,30 +356,33 @@ def read_last_row_and_message():
     else:
         raise RuntimeError("Configura SHEET_NAME o TABLE_NAME.")
 
-    # 1) Calcula firma del contenido actual
+    # 4) Idempotencia por firma
     current_sig = _compute_signature_from_row(headers, last_row)
     last_sig = _load_last_signature()
-
     if last_sig and current_sig == last_sig:
-        # 2) Ya fue enviado: manda aviso SOLO al supergrupo respondiendo al último mensaje
         notice = "ℹ️ No hay actualizaciones. Revisa este último mensaje enviado."
         last_mid = _load_last_group_message_id()
-        _send_telegram_message(notice, chat_id=TELEGRAM_CHAT_ID, reply_to_message_id=(last_mid or None))
+        _send_telegram_message(
+            notice,
+            chat_id=TELEGRAM_CHAT_ID,
+            reply_to_message_id=(last_mid or None)
+        )
         return notice
 
-    # 3) Es nuevo: construye mensaje y publícalo
+    # 5) Construye y envía
     msg = build_message_with_fields(headers, last_row)
     send_resp = _send_telegram_message(msg, chat_id=TELEGRAM_CHAT_ID)
-    # Guarda el message_id y la firma
     try:
-        # Bot API devuelve {"ok":true,"result":{"message_id":...}}
-        message_id = int(send_resp.get("result", {}).get("message_id") or send_resp.get("message_id") or 0)
+        message_id = int(send_resp.get("result", {}).get("message_id")
+                         or send_resp.get("message_id") or 0)
         if message_id:
             _save_last_group_message_id(message_id)
-    except:
+    except Exception:
         pass
 
     _save_last_signature(current_sig)
+    return "Mensaje enviado"
+
 
 # ===== Confirmación basada en reply (texto plano) =====
 def send_confirmation_from_reply(msg):
