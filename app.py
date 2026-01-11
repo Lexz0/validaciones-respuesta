@@ -167,7 +167,6 @@ def get_drive_item_from_share(sharing_url: str, access_token: str):
     r = requests.get(
         f"https://graph.microsoft.com/v1.0/shares/{encoded}/driveItem",
         headers={
-            "Authorization": f"Bearer {token}",
             "Authorization": f"Bearer {access_token}",
             "Prefer": "redeemSharingLink"  # o redeemSharingLinkIfNecessary
         },
