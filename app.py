@@ -168,6 +168,14 @@ def get_drive_item_from_share(sharing_url: str, access_token: str):
         f"{GRAPH}/shares/{encoded}/driveItem",
         headers={"Authorization": f"Bearer {access_token}"},
         timeout=30,
+        
+        f"https://graph.microsoft.com/v1.0/shares/{encoded}/driveItem",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Prefer": "redeemSharingLink"  # o redeemSharingLinkIfNecessary
+        },
+        timeout=30,
+
     )
     r.raise_for_status()
     return r.json()
