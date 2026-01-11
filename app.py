@@ -433,6 +433,33 @@ def _is_duplicate_update(update_id: int) -> bool:
         pass
     return False
 
+
+def get_drive_item_from_share(sharing_url: str, access_token: str):
+    """
+    Resuelve el driveItem a partir de un enlace compartido.
+    """
+    if not access_token or not access_token.strip():
+        # Esto evita mandar Authorization vacío y nos da un mensaje claro.
+        raise RuntimeError("No hay access_token para llamar a Graph.")
+
+    encoded = encode_sharing_url(sharing_url)
+
+    # DEBUG opcional: ver que el token no esté vacío y su longitud
+    # print(f"[DEBUG] access_token length: {len(access_token)}")
+    # print(f"[DEBUG] encoded share: {encoded}")
+
+    r = requests.get(
+        f"https://graph.microsoft.com/v1.0/shares/{encoded}/driveItem",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Prefer": "redeemSharingLink",  # o 'redeemSharingLinkIfNecessary'
+        },
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
 # ===== Endpoints =====
 @app.route("/init-auth", methods=["GET"])
 def init_auth():
@@ -504,3 +531,18 @@ def telegram_webhook():
     else:
         # Ignora otros textos
         return {"ok": True, "ignored": True}
+
+@app.get("/me")
+def who_am_i():
+    access_token = get_token_silent_only()
+    r = requests.get(
+        "https://graph.microsoft.com/v1.0/me",
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=30
+    )
+    try:
+        r.raise_for_status()
+    except Exception as e:
+        # Devuelve el cuerpo para depurar scope/consent/authority
+        return {"ok": False, "error": str(e), "body": r.text}, r.status_code
+    return r.json(), 200
