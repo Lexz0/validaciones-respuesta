@@ -77,24 +77,44 @@ def _public_client(cache=None):
         token_cache=cache
     )
 
+
 def get_token_silent_only():
     cache = _load_token_cache()
     app_auth = _public_client(cache)
     scopes = SCOPES
 
+    # 1) Intento silencioso, primero con account[0], luego sin account
     accounts = app_auth.get_accounts()
     result = None
     if accounts:
         result = app_auth.acquire_token_silent(scopes, account=accounts[0])
     if not result or "access_token" not in result:
-        # Fallback sin account: MSAL elige la cuenta desde la caché
         result = app_auth.acquire_token_silent(scopes, account=None)
 
+    # 2) Si no hay token, disparamos Device Code (con mensaje a Telegram personal si está configurado)
     if not result or "access_token" not in result:
-        raise RuntimeError("Silent token no disponible. Repite /init-auth o revisa AUTHORITY/SCOPES/consent.")
+        flow = app_auth.initiate_device_flow(scopes=scopes)
+        if "user_code" not in flow:
+            raise RuntimeError(
+                f"No se pudo iniciar device flow. Revisa AZURE_CLIENT_ID y AUTHORITY "
+                f"('consumers' vs '{TENANT_ID}'), y 'Allow public client flows' en la app. Detalle: {flow}"
+            )
+        try:
+            df_msg = flow.get("message") or f"Visita {flow.get('verification_uri')} y usa el código {flow.get('user_code')}"
+            if TELEGRAM_BOT_TOKEN and TELEGRAM_PERSONAL_CHAT_ID:
+                _send_telegram_message(df_msg, chat_id=TELEGRAM_PERSONAL_CHAT_ID)
+        except Exception:
+            pass  # no interrumpas si Telegram falla
+
+        # BLOQUEA hasta completar login en https://microsoft.com/devicelogin
+        result = app_auth.acquire_token_by_device_flow(flow)
+
+    if not result or "access_token" not in result:
+        raise RuntimeError("No se obtuvo access_token tras Device Code. Revisa configuración y vuelve a intentar.")
 
     _save_token_cache(cache)
     return result["access_token"]
+
 
 def _auth_worker(flow, cache):
     """Hilo en segundo plano que bloquea hasta que completes el Device Flow."""
