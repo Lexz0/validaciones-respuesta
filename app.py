@@ -162,16 +162,31 @@ def encode_sharing_url(u: str) -> str:
     b = base64.urlsafe_b64encode(u.encode("utf-8")).decode("utf-8").rstrip("=")
     return f"u!{b}"
 
+
 def get_drive_item_from_share(sharing_url: str, access_token: str):
+    """
+    Resuelve el driveItem a partir de un enlace compartido (share URL) de OneDrive/SharePoint.
+    - 'sharing_url' es el enlace tal cual (ej.: https://1drv.ms/... o https://<tenant>-my.sharepoint.com/...)
+    - 'access_token' debe ser un JWT válido de Microsoft Graph.
+
+    Devuelve: dict (JSON de driveItem)
+    Lanza: RuntimeError si falta token o requests.HTTPError si Graph devuelve error.
+    """
+    # Verificación defensiva: no hagas la llamada si el token está vacío
+    if not access_token or not access_token.strip():
+        raise RuntimeError("No hay access_token para llamar a Graph.")
+
     encoded = encode_sharing_url(sharing_url)
+
     r = requests.get(
         f"https://graph.microsoft.com/v1.0/shares/{encoded}/driveItem",
         headers={
             "Authorization": f"Bearer {access_token}",
-            "Prefer": "redeemSharingLink"  # o redeemSharingLinkIfNecessary
+            # Redime el enlace compartido para otorgar acceso como si se abriera en el navegador:
+            # (puedes usar 'redeemSharingLinkIfNecessary' si prefieres acceso solo para esta petición)
+            "Prefer": "redeemSharingLink"
         },
         timeout=30,
-
     )
     r.raise_for_status()
     return r.json()
