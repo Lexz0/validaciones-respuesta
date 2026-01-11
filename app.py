@@ -165,10 +165,6 @@ def encode_sharing_url(u: str) -> str:
 def get_drive_item_from_share(sharing_url: str, access_token: str):
     encoded = encode_sharing_url(sharing_url)
     r = requests.get(
-        f"{GRAPH}/shares/{encoded}/driveItem",
-        headers={"Authorization": f"Bearer {access_token}"},
-        timeout=30,
-        
         f"https://graph.microsoft.com/v1.0/shares/{encoded}/driveItem",
         headers={
             "Authorization": f"Bearer {token}",
