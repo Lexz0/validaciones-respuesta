@@ -9,30 +9,26 @@ from urllib.parse import urlparse
 from flask import Flask, request
 
 # ===== Config =====
-AZURE_CLIENT_ID = os.getenv("AZURE_CLIENT_ID") or os.getenv("CLIENT_ID")  # compat con tu nombre anterior
-
+AZURE_CLIENT_ID = os.getenv("AZURE_CLIENT_ID") or os.getenv("CLIENT_ID")  # compat con nombre anterior
 # Enlace compartido de Excel (OneDrive/SharePoint)
 EXCEL_SHARE_URL = os.getenv("EXCEL_SHARE_URL", "")
-
 # TENANT_ID robusto: si está vacío en env, usa 'common'
 TENANT_ID = os.getenv("TENANT_ID") or "common"
-
 # Detecta si el share es de OneDrive personal (consumer: 1drv.ms / onedrive.live.com)
 _share_host = urlparse(EXCEL_SHARE_URL).netloc.lower()
 IS_CONSUMER = ("1drv.ms" in _share_host) or ("onedrive.live.com" in _share_host)
-
 # Authority: consumidores para 1drv.ms; de lo contrario, usar TENANT_ID/common
 AUTHORITY = f"https://login.microsoftonline.com/{'consumers' if IS_CONSUMER else TENANT_ID}"
-
 # Scopes solo de Graph (sin openid/profile/offline_access)
 SCOPES = ["User.Read", "Files.ReadWrite"]
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")          # supergrupo destino
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # supergrupo destino
 TELEGRAM_PERSONAL_CHAT_ID = os.getenv("TELEGRAM_PERSONAL_CHAT_ID")
 
-SHEET_NAME = os.getenv("SHEET_NAME")   # ej: "Hoja1"
-TABLE_NAME = os.getenv("TABLE_NAME")   # ej: "Tabla1"
+SHEET_NAME = os.getenv("SHEET_NAME")  # ej: "Hoja1"
+TABLE_NAME = os.getenv("TABLE_NAME")  # ej: "Tabla1"
+
 ONLY_TRIGGER_WORD = (os.getenv("ONLY_TRIGGER_WORD") or "OK").strip().upper()
 
 # ===== Persistencia local (ids/firmas). Los tokens van a Redis =====
@@ -47,13 +43,8 @@ app = Flask(__name__)
 import msal
 from upstash_redis import Redis
 
-
-#CAMBIO
 REDIS = Redis.from_env()  # usa UPSTASH_REDIS_REST_URL y UPSTASH_REDIS_REST_TOKEN
-#CACHE_KEY = "msal_cache_default"
-# Antes: CACHE_KEY = "msal_cache_default"
 CACHE_KEY = f"msal_cache:{AZURE_CLIENT_ID}:{'consumers' if IS_CONSUMER else TENANT_ID}"
-
 
 _auth_thread = None
 _auth_state = {"running": False, "message": None, "error": None}
@@ -79,30 +70,42 @@ def _public_client(cache=None):
     return msal.PublicClientApplication(
         client_id=AZURE_CLIENT_ID,
         authority=AUTHORITY,
-        token_cache=cache
+        token_cache=cache,
     )
 
+def try_get_token_silent():
+    """Intenta obtener token solo en modo silencioso. Devuelve token o None."""
+    cache = _load_token_cache()
+    app_auth = _public_client(cache)
+    accounts = app_auth.get_accounts()
+    result = None
+    if accounts:
+        result = app_auth.acquire_token_silent(SCOPES, account=accounts[0])
+    if not result or "access_token" not in result:
+        result = app_auth.acquire_token_silent(SCOPES, account=None)
+    if result and "access_token" in result:
+        _save_token_cache(cache)
+        return result["access_token"]
+    return None
 
 def get_token_silent_only():
+    """Como antes: intenta silencioso, si falla inicia Device Flow y BLOQUEA hasta completar."""
     cache = _load_token_cache()
     app_auth = _public_client(cache)
     scopes = SCOPES
-
-    # 1) Intento silencioso, primero con account[0], luego sin account
+    # 1) Intento silencioso
     accounts = app_auth.get_accounts()
     result = None
     if accounts:
         result = app_auth.acquire_token_silent(scopes, account=accounts[0])
     if not result or "access_token" not in result:
         result = app_auth.acquire_token_silent(scopes, account=None)
-
-    # 2) Si no hay token, disparamos Device Code (con mensaje a Telegram personal si está configurado)
+    # 2) Fallback a Device Code (bloqueante)
     if not result or "access_token" not in result:
         flow = app_auth.initiate_device_flow(scopes=scopes)
         if "user_code" not in flow:
             raise RuntimeError(
-                f"No se pudo iniciar device flow. Revisa AZURE_CLIENT_ID y AUTHORITY "
-                f"('consumers' vs '{TENANT_ID}'), y 'Allow public client flows' en la app. Detalle: {flow}"
+                f"No se pudo iniciar device flow. Revisa AZURE_CLIENT_ID y AUTHORITY ('consumers' vs '{TENANT_ID}'). Detalle: {flow}"
             )
         try:
             df_msg = flow.get("message") or f"Visita {flow.get('verification_uri')} y usa el código {flow.get('user_code')}"
@@ -110,31 +113,26 @@ def get_token_silent_only():
                 _send_telegram_message(df_msg, chat_id=TELEGRAM_PERSONAL_CHAT_ID)
         except Exception:
             pass  # no interrumpas si Telegram falla
-
-        # BLOQUEA hasta completar login en https://microsoft.com/devicelogin
+        # BLOQUEA hasta completar login
         result = app_auth.acquire_token_by_device_flow(flow)
-
-    if not result or "access_token" not in result:
-        raise RuntimeError("No se obtuvo access_token tras Device Code. Revisa configuración y vuelve a intentar.")
-
+        if not result or "access_token" not in result:
+            raise RuntimeError("No se obtuvo access_token tras Device Code. Revisa configuración y vuelve a intentar.")
     _save_token_cache(cache)
     return result["access_token"]
-
 
 def _auth_worker(flow, cache):
     """Hilo en segundo plano que bloquea hasta que completes el Device Flow."""
     global _auth_state
     try:
         app_auth = _public_client(cache)
-        result = app_auth.acquire_token_by_device_flow(flow)  # bloquea hasta que completes
+        result = app_auth.acquire_token_by_device_flow(flow)  # bloquea hasta completar
         if "access_token" not in result:
-            got_rt =  "refresh_token" in result
-            
-print(f"[INFO] DeviceFlow completado. refresh_token presente: {got_rt}")
-    _save_token_cache(cache)
-
+            got_rt = "refresh_token" in result
+            print(f"[INFO] DeviceFlow terminó sin access_token. refresh_token presente: {got_rt}")
+            _save_token_cache(cache)
             _auth_state["error"] = f"Error de autenticación: {result}"
         else:
+            print("[INFO] DeviceFlow completado con access_token.")
             _save_token_cache(cache)
             _auth_state["message"] = "Autenticado y token cacheado."
     except Exception as e:
@@ -145,28 +143,22 @@ print(f"[INFO] DeviceFlow completado. refresh_token presente: {got_rt}")
 def start_device_flow_async():
     """Arranca el Device Flow sin bloquear la petición, devuelve el código y la URL."""
     global _auth_thread, _auth_state
-
     if _auth_state.get("running"):
         return {"status": "in-progress", "message": "Device flow ya en progreso."}
-
     cache = _load_token_cache()
     app_auth = _public_client(cache)
-
-    # Intento silencioso por si ya hay token (ej. redeploy, reinicio, etc.)
+    # Intento silencioso por si ya hay token (redeploy, reinicio, etc.)
     accounts = app_auth.get_accounts()
     if accounts:
         result = app_auth.acquire_token_silent(SCOPES, account=accounts[0])
         if result and "access_token" in result:
             _save_token_cache(cache)
             return {"status": "ready", "message": "Token ya disponible en caché."}
-
     flow = app_auth.initiate_device_flow(scopes=SCOPES)
     if "user_code" not in flow:
         raise RuntimeError(
-            f"No se pudo iniciar device flow. Revisa AZURE_CLIENT_ID y AUTHORITY "
-            f"('consumers' vs '{TENANT_ID}'), y habilita 'Allow public client flows' en la app. Detalle: {flow}"
+            f"No se pudo iniciar device flow. Revisa AZURE_CLIENT_ID y AUTHORITY ('consumers' vs '{TENANT_ID}'), y habilita 'Allow public client flows' en la app. Detalle: {flow}"
         )
-
     # (Opcional) enviar el mensaje del device flow por Telegram para login inmediato
     try:
         df_msg = flow.get("message") or f"Visita {flow.get('verification_uri')} y usa el código {flow.get('user_code')}"
@@ -174,11 +166,9 @@ def start_device_flow_async():
             _send_telegram_message(df_msg, chat_id=TELEGRAM_PERSONAL_CHAT_ID)
     except Exception as e:
         print(f"[WARN] No se pudo enviar mensaje de device flow por Telegram: {e}")
-
     _auth_state = {"running": True, "message": None, "error": None}
     _auth_thread = threading.Thread(target=_auth_worker, args=(flow, cache), daemon=True)
     _auth_thread.start()
-
     return {
         "status": "started",
         "verification_uri": flow.get("verification_uri"),
@@ -203,15 +193,13 @@ def get_drive_item_from_share(sharing_url: str, access_token: str):
     """
     if not access_token or not access_token.strip():
         raise RuntimeError("No hay access_token para llamar a Graph.")
-
     encoded = encode_sharing_url(sharing_url)
     r = requests.get(
         f"{GRAPH}/shares/{encoded}/driveItem",
         headers={
             "Authorization": f"Bearer {access_token}",
-            # Redime el enlace compartido; similar a abrirlo en navegador para aceptar el gesto de compartir:
-            "Prefer": "redeemSharingLink"
-            # Alternativa temporal: "redeemSharingLinkIfNecessary"
+            # Redime el enlace compartido (similar a abrirlo en navegador para aceptar el gesto de compartir)
+            "Prefer": "redeemSharingLink",
         },
         timeout=30,
     )
@@ -223,7 +211,14 @@ def get_used_range_values(item_id: str, sheet_name: str, access_token: str):
     r = requests.get(url, headers={"Authorization": f"Bearer {access_token}"}, timeout=30)
     r.raise_for_status()
     data = r.json()
-    return data.get("text", [])
+    return data.get("text", [])  # matriz 2D
+
+def get_table_headers(item_id: str, table_name: str, access_token: str):
+    url = f"{GRAPH}/drive/items/{item_id}/workbook/tables('{table_name}')/headerRowRange?$select=text"
+    r = requests.get(url, headers={"Authorization": f"Bearer {access_token}"}, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    return data.get("text", [[]])[0]
 
 def get_table_rows(item_id: str, table_name: str, access_token: str):
     url = f"{GRAPH}/drive/items/{item_id}/workbook/tables('{table_name}')/rows"
@@ -237,18 +232,24 @@ def get_table_rows(item_id: str, table_name: str, access_token: str):
     return rows
 
 # ===== Telegram (texto plano, sin parse_mode) =====
+
 def _send_telegram_message(text: str, chat_id: str = None, reply_to_message_id: int = None):
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN no está configurado.")
+    target_chat = chat_id or TELEGRAM_CHAT_ID
+    if not target_chat:
+        raise RuntimeError("No hay chat_id destino (TELEGRAM_CHAT_ID).")
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
-        "chat_id": chat_id or TELEGRAM_CHAT_ID,
+        "chat_id": target_chat,
         "text": text,
         "disable_web_page_preview": True,
     }
     if reply_to_message_id:
         payload["reply_to_message_id"] = reply_to_message_id
         payload["allow_sending_without_reply"] = True
-
-    r = requests.post(url, json=payload, timeout=20)
+    r = requests.post(url, json=payload, timeout=30)
     try:
         r.raise_for_status()
     except Exception as e:
@@ -256,11 +257,11 @@ def _send_telegram_message(text: str, chat_id: str = None, reply_to_message_id: 
             requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
                 json={
-                    "chat_id": TELEGRAM_CHAT_ID,
+                    "chat_id": TELEGRAM_CHAT_ID or target_chat,
                     "text": f"⚠️ Error al enviar: {str(e)}\nResp: {r.text}",
                     "disable_web_page_preview": True,
                 },
-                timeout=10
+                timeout=15,
             )
         except Exception:
             pass
@@ -268,6 +269,7 @@ def _send_telegram_message(text: str, chat_id: str = None, reply_to_message_id: 
     return r.json()
 
 # ===== Normalización de encabezados =====
+
 def _normalize_header(h: str) -> str:
     h = (h or "").strip().lower()
     h = "".join(c for c in unicodedata.normalize("NFD", h) if unicodedata.category(c) != "Mn")  # quita acentos
@@ -275,14 +277,21 @@ def _normalize_header(h: str) -> str:
         h = h.replace(ch, "_")
     return h
 
+# ===== Alinear headers y row =====
+
+def _align(headers, row):
+    n = max(len(headers), len(row))
+    hh = list(headers) + [""] * (n - len(headers))
+    rr = list(row) + [""] * (n - len(row))
+    return hh, rr
+
 # ===== Firma del último mensaje enviado =====
+
 def _compute_signature_from_row(headers, last_row) -> str:
     try:
-        if headers and len(headers) == len(last_row):
-            keys = [_normalize_header(h) for h in headers]
-            row_dict = {k: ("" if v is None else str(v)) for k, v in zip(keys, last_row)}
-        else:
-            row_dict = {f"col_{i}": ("" if v is None else str(v)) for i, v in enumerate(last_row)}
+        headers, last_row = _align(headers, last_row)
+        keys = [_normalize_header(h) for h in headers]
+        row_dict = {k: ("" if v is None else str(v)) for k, v in zip(keys, last_row)}
         payload = json.dumps(row_dict, ensure_ascii=False, sort_keys=True)
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
     except Exception:
@@ -320,33 +329,50 @@ def _load_last_group_message_id() -> int:
         pass
     return 0
 
+# ===== Normalización de trigger =====
+
+def _normalize_trigger(text: str) -> str:
+    t = (text or "").strip().upper()
+    # quita algunos adornos comunes
+    t = t.replace("✅", "").replace("!", "").strip()
+    return t
+
+# ===== Última fila no vacía =====
+
+def _last_nonempty_row(rows_2d):
+    for row in reversed(rows_2d or []):
+        if any((c or "").strip() for c in row):
+            return row
+    return []
+
 # ===== Formato del mensaje (texto plano) =====
+
 def build_message_with_fields(headers, last_row):
-    if headers and len(headers) == len(last_row):
-        keys = [_normalize_header(h) for h in headers]
-        row = {k: v for k, v in zip(keys, last_row)}
-    else:
-        row = {f"col_{i}": v for i, v in enumerate(last_row)}
+    headers, last_row = _align(headers or [], last_row or [])
+    keys = [_normalize_header(h) for h in headers]
+    row = {k: v for k, v in zip(keys, last_row)}
 
     responsable = row.get("responsable", "")
     agrupacion = row.get("agrupacion", "")
     mes_planificado = row.get("mes_planificado", row.get("mes", ""))
     dictamen_estatus = row.get("dictamen_estatus", row.get("status", ""))
-    codigo_de_equipo = row.get("codigo_de_equipo", row.get("codigo_de_equipo", ""))
+    codigo_de_equipo = row.get("codigo_de_equipo", row.get("codigo_equipo", ""))
     nombre_instrumento = row.get("nombre_instrumento", "")
     equipo_sistema_ubicacion = row.get("equipo_sistema_ubicacion", "")
     departamento = row.get("departamento", "")
     actividad = row.get("actividad", row.get("tarea", ""))
 
-    # menciones
+    # menciones – solo usernames válidos (sin espacios)
     mentions = []
     for token in (responsable or "").replace(";", ",").split(","):
         u = token.strip()
         if not u:
             continue
-        if not u.startswith("@"):
-            u = "@" + u
-        mentions.append(u)
+        if u.startswith("@") and " " not in u:
+            mentions.append(u)
+        elif " " not in u:
+            mentions.append("@" + u)
+        # Si tiene espacios, lo omitimos para no romper el mensaje
     mentions_line = " ".join(mentions) if mentions else ""
 
     lines = []
@@ -365,88 +391,92 @@ def build_message_with_fields(headers, last_row):
     return "\n".join(lines)
 
 # ===== Lectura y envío con verificación de duplicado + reply =====
-def read_last_row_and_message():
-    # 1) Obtiene el token una sola vez
-    access_token = get_token_silent_only()
 
-    # 2) Resuelve el driveItem del enlace compartido
+def read_last_row_and_message(access_token: str):
+    # 1) Resuelve el driveItem del enlace compartido
     item = get_drive_item_from_share(EXCEL_SHARE_URL, access_token)
     item_id = item.get("id")
     if not item_id:
         raise RuntimeError("No se obtuvo item.id del enlace compartido.")
 
-    # 3) Lee filas desde tabla u hoja
+    # 2) Lee filas desde tabla u hoja
     if TABLE_NAME:
+        headers = get_table_headers(item_id, TABLE_NAME, access_token)
         rows = get_table_rows(item_id, TABLE_NAME, access_token)
         if not rows:
             raise RuntimeError("La tabla no devolvió filas.")
         last_row = rows[-1]
-        headers = rows[0] if len(rows) > 1 else []
     elif SHEET_NAME:
         values = get_used_range_values(item_id, SHEET_NAME, access_token)
         if not values:
             raise RuntimeError("La hoja no devolvió valores.")
         headers = values[0] if len(values) >= 1 else []
-        last_row = values[-1]
+        # tomar la última fila con contenido (excluyendo encabezados)
+        last_row = _last_nonempty_row(values[1:] if len(values) >= 2 else values)
+        if not last_row:
+            raise RuntimeError("No se encontró última fila con contenido.")
     else:
         raise RuntimeError("Configura SHEET_NAME o TABLE_NAME.")
 
-    # 4) Idempotencia por firma
+    # 3) Idempotencia por firma
     current_sig = _compute_signature_from_row(headers, last_row)
     last_sig = _load_last_signature()
-
     if last_sig and current_sig == last_sig:
         notice = "ℹ️ No hay actualizaciones. Revisa este último mensaje enviado."
         last_mid = _load_last_group_message_id()
         _send_telegram_message(
             notice,
             chat_id=TELEGRAM_CHAT_ID,
-            reply_to_message_id=(last_mid or None)
+            reply_to_message_id=(last_mid or None),
         )
         return notice
 
-    # 5) Construye y envía
+    # 4) Construye y envía
     msg = build_message_with_fields(headers, last_row)
     send_resp = _send_telegram_message(msg, chat_id=TELEGRAM_CHAT_ID)
+    # extracción robusta de message_id
+    message_id = 0
     try:
-        message_id = int(send_resp.get("result", {}).get("message_id")
-                         or send_resp.get("message_id") or 0)
-        if message_id:
-            _save_last_group_message_id(message_id)
+        if isinstance(send_resp, dict):
+            if "result" in send_resp and isinstance(send_resp["result"], dict):
+                message_id = int(send_resp["result"].get("message_id", 0))
+            elif "message_id" in send_resp:
+                message_id = int(send_resp.get("message_id", 0))
     except Exception:
         pass
+    if message_id:
+        _save_last_group_message_id(message_id)
 
     _save_last_signature(current_sig)
     return "Mensaje enviado"
 
 # ===== Confirmación basada en reply (texto plano) =====
+
 def send_confirmation_from_reply(msg):
     """
     Envía al chat personal una confirmación basada en el mensaje al que se respondió con 'OK'.
     """
     if not TELEGRAM_PERSONAL_CHAT_ID:
         raise RuntimeError("Define TELEGRAM_PERSONAL_CHAT_ID para enviar la confirmación personal.")
-
     reply = msg.get("reply_to_message") or {}
     original_text = reply.get("text") or reply.get("caption") or ""
     if not original_text:
         original_text = "(mensaje original sin texto)"
-
     from_user = msg.get("from", {}) or {}
     who = from_user.get("first_name") or from_user.get("username") or "alguien"
-
     confirmation = f"✅ Tarea confirmada por {who}. Márcala como terminada.\n\n{original_text}"
     _send_telegram_message(confirmation, chat_id=TELEGRAM_PERSONAL_CHAT_ID)
     return confirmation
 
 # ===== Dedup por update_id =====
+
 def _is_duplicate_update(update_id: int) -> bool:
     try:
         if os.path.exists(LAST_UPDATE_FILE):
             with open(LAST_UPDATE_FILE, "r") as f:
                 last = int(f.read().strip())
-                if update_id <= last:
-                    return True
+            if update_id <= last:
+                return True
         with open(LAST_UPDATE_FILE, "w") as f:
             f.write(str(update_id))
     except Exception:
@@ -471,8 +501,8 @@ def auth_status():
         "error": _auth_state.get("error"),
     }
     try:
-        _ = get_token_silent_only()
-        status["token_ready"] = True
+        _ = try_get_token_silent()
+        status["token_ready"] = bool(_)
     except Exception:
         status["token_ready"] = False
     return {"ok": True, "status": status}
@@ -494,7 +524,6 @@ def reset_auth():
 def telegram_webhook():
     data = request.get_json(force=True) or {}
     update_id = data.get("update_id")
-
     # Idempotencia: evita reprocesar el mismo update
     if isinstance(update_id, int) and _is_duplicate_update(update_id):
         return {"ok": True, "duplicate": True}
@@ -502,15 +531,29 @@ def telegram_webhook():
     msg = data.get("message") or {}  # solo 'message', ignoramos 'edited_message'
     text = (msg.get("text") or "").strip()
 
-    if text.upper() == ONLY_TRIGGER_WORD:
+    if _normalize_trigger(text) == ONLY_TRIGGER_WORD:
         try:
-            # Si es reply a un mensaje, enviamos confirmación personal con el contenido original
+            # Si es reply a un mensaje, enviamos confirmación personal
             if msg.get("reply_to_message"):
                 confirmation_preview = send_confirmation_from_reply(msg)
                 return {"ok": True, "preview": confirmation_preview}
 
-            # Si NO es reply: verificar cambios y publicar o avisar
-            preview = read_last_row_and_message()
+            # Si NO es reply: verificar token sin bloquear
+            access_token = try_get_token_silent()
+            if not access_token:
+                payload = start_device_flow_async()
+                note = payload.get("note") or "Autorización requerida."
+                try:
+                    _send_telegram_message(
+                        f"🔐 {note}\nCódigo: {payload.get('user_code')}\nURL: {payload.get('verification_uri')}",
+                        chat_id=TELEGRAM_CHAT_ID,
+                    )
+                except Exception:
+                    pass
+                return {"ok": True, "preview": "Se inició Device Flow. Intenta de nuevo cuando el token esté listo."}
+
+            # Con token listo: procede
+            preview = read_last_row_and_message(access_token)
             return {"ok": True, "preview": preview}
         except Exception as e:
             try:
@@ -528,7 +571,7 @@ def who_am_i():
     r = requests.get(
         f"{GRAPH}/me",
         headers={"Authorization": f"Bearer {access_token}"},
-        timeout=30
+        timeout=30,
     )
     try:
         r.raise_for_status()
@@ -539,13 +582,20 @@ def who_am_i():
 @app.get("/diag")
 def diag():
     try:
-        access_token = get_token_silent_only()
+        access_token = try_get_token_silent()
         return {
             "authority": AUTHORITY,
-            "token_len": len(access_token),
+            "token_len": len(access_token) if access_token else 0,
             "scopes": SCOPES,
             "share_host": _share_host,
-            "is_consumer": IS_CONSUMER
+            "is_consumer": IS_CONSUMER,
+            "token_ready": bool(access_token),
         }, 200
     except Exception as e:
         return {"authority": AUTHORITY, "error": str(e)}, 500
+
+if __name__ == "__main__":
+    # Para pruebas locales
+    port = int(os.getenv("PORT") or 8000)
+    app.run(host="0.0.0.0", port=port)
+``
