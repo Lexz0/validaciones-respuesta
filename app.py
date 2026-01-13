@@ -128,6 +128,11 @@ def _auth_worker(flow, cache):
         app_auth = _public_client(cache)
         result = app_auth.acquire_token_by_device_flow(flow)  # bloquea hasta que completes
         if "access_token" not in result:
+            got_rt =  "refresh_token" in result
+            
+print(f"[INFO] DeviceFlow completado. refresh_token presente: {got_rt}")
+    _save_token_cache(cache)
+
             _auth_state["error"] = f"Error de autenticación: {result}"
         else:
             _save_token_cache(cache)
