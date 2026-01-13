@@ -47,8 +47,13 @@ app = Flask(__name__)
 import msal
 from upstash_redis import Redis
 
+
+#CAMBIO
 REDIS = Redis.from_env()  # usa UPSTASH_REDIS_REST_URL y UPSTASH_REDIS_REST_TOKEN
-CACHE_KEY = "msal_cache_default"
+#CACHE_KEY = "msal_cache_default"
+# Antes: CACHE_KEY = "msal_cache_default"
+CACHE_KEY = f"msal_cache:{AZURE_CLIENT_ID}:{'consumers' if IS_CONSUMER else TENANT_ID}"
+
 
 _auth_thread = None
 _auth_state = {"running": False, "message": None, "error": None}
